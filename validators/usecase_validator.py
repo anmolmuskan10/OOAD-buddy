@@ -1172,4 +1172,3 @@ class UseCaseValidator(BaseValidator):
             summary = f"❌ {ec} error(s) and {wc} warning(s) found."
 
         return self._build_result(errors, score, summary)
-
