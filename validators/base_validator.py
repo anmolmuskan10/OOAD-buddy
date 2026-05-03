@@ -116,4 +116,3 @@ class BaseValidator:
             "info":         [e.to_dict() for e in errors if e.severity == "INFO"],
             "total_issues": len(errors),
         }
-
