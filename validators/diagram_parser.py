@@ -236,4 +236,3 @@ def parse_diagram(raw_shapes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         shapes = parse_diagram(raw_shapes_from_app)
     """
     return DiagramParser().normalize(raw_shapes)
-
