@@ -337,4 +337,3 @@ class NLPExtractor:
                             "to":      _to_pascal_case(o),
                         })
         return interactions
-
