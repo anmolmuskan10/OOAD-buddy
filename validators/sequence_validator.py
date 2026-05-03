@@ -774,4 +774,3 @@ class SequenceDiagramValidator(BaseValidator):
             t.strip() for t in raw
             if t.strip() and t.strip().lower() not in _NON_PARTICIPANT_TOKENS
         ]
-
