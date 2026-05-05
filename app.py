@@ -3,10 +3,10 @@ load_dotenv()
 
 """
 OOAD Diagram Validation Engine - Flask Backend
-Hybrid Validation: Gemini AI (primary) + Rule-Based (fallback)
+Hybrid Validation: OpenAI (primary) + Rule-Based (fallback)
 All 3 diagram types: class, usecase, sequence
 
-FIX: Image upload se diagram_type auto-detect via Gemini Vision.
+FIX: Image upload se diagram_type auto-detect via OpenAI Vision.
      Agar diagram_type missing/unknown ho toh image analyse karke
      automatically pata lagta hai ke class/usecase/sequence hai.
 """
@@ -25,7 +25,7 @@ from nlp_extractor import NLPExtractor
 from validators.class_validator import ClassDiagramValidator
 from validators.usecase_validator import UseCaseValidator
 from validators.sequence_validator import SequenceDiagramValidator
-from validators.openai_validator import validate_with_gemini, validate_with_gemini_image
+from validators.openai_validator import validate_with_openai, validate_with_openai_image
 
 logging.basicConfig(level=logging.INFO)
 _log = logging.getLogger(__name__)
@@ -46,7 +46,7 @@ def _get_api_key():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  AUTO-DETECT diagram type from image using Gemini Vision
+#  AUTO-DETECT diagram type from image using OpenAI Vision
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _detect_diagram_type_from_image(image_b64: str, mime_type: str = "image/png") -> str:
@@ -226,24 +226,24 @@ def validate():
     # ── NLP extraction ─────────────────────────────────────────────────────
     extracted = extractor.extract(scenario)
 
-    # ── Gemini AI first (PRIMARY) ──────────────────────────────────────────
-    # Jab image available ho → Gemini Vision use karo (image directly analyze)
-    # Jab sirf shapes hon → text-based Gemini use karo
+    # ── OpenAI first (PRIMARY) ──────────────────────────────────────────
+    # Jab image available ho → OpenAI Vision use karo (image directly analyze)
+    # Jab sirf shapes hon → text-based OpenAI use karo
     if image_b64:
-        _log.info("Image available — using Gemini Vision for '%s' diagram", dtype)
-        gemini_result = validate_with_gemini_image(
+        _log.info("Image available — using OpenAI Vision for '%s' diagram", dtype)
+        openai_result = validate_with_openai_image(
             scenario=scenario,
             image_b64=image_b64,
             mime_type=mime_type,
             diagram_type=dtype,
         )
     else:
-        gemini_result = validate_with_gemini(scenario, shapes, diagram_type=dtype)
+        openai_result = validate_with_openai(scenario, shapes, diagram_type=dtype)
 
-    if gemini_result:
+    if openai_result:
         _log.info("OpenAI validation used for '%s' diagram", dtype)
-        gemini_result["validation_mode"] = "openai"
-        final_result = gemini_result
+        openai_result["validation_mode"] = "openai"
+        final_result = openai_result
     else:
         # Fallback to rule-based
         _log.warning("OpenAI unavailable - rule-based fallback for '%s'", dtype)
