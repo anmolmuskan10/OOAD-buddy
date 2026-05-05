@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 """
 OOAD Diagram Validation Engine - Flask Backend
 Hybrid Validation: Gemini AI (primary) + Rule-Based (fallback)
@@ -22,7 +25,7 @@ from nlp_extractor import NLPExtractor
 from validators.class_validator import ClassDiagramValidator
 from validators.usecase_validator import UseCaseValidator
 from validators.sequence_validator import SequenceDiagramValidator
-from validators.gemini_validator import validate_with_gemini, validate_with_gemini_image
+from validators.openai_validator import validate_with_gemini, validate_with_gemini_image
 
 logging.basicConfig(level=logging.INFO)
 _log = logging.getLogger(__name__)
@@ -31,14 +34,14 @@ app       = Flask(__name__)
 CORS(app)
 extractor = NLPExtractor()
 
-# Gemini API config
-_GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
-_VISION_MODELS   = ["gemini-2.5-flash-lite", "gemini-2.0-flash-lite", "gemini-2.0-flash"]
+# OpenAI API config
+_OPENAI_API_BASE = "https://api.openai.com/v1"
+_VISION_MODELS   = ["gpt-4o"]
 _TIMEOUT         = 60
 
 
 def _get_api_key():
-    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
     return key if key else None
 
 
@@ -48,13 +51,13 @@ def _get_api_key():
 
 def _detect_diagram_type_from_image(image_b64: str, mime_type: str = "image/png") -> str:
     """
-    Gemini Vision se image analyse karke diagram type detect karo.
+    OpenAI Vision se image analyse karke diagram type detect karo.
     Returns: 'class' | 'usecase' | 'sequence'
     Default: 'class' (agar detect na ho sake)
     """
     api_key = _get_api_key()
     if not api_key:
-        _log.warning("GEMINI_API_KEY missing - cannot auto-detect diagram type")
+        _log.warning("OPENAI_API_KEY missing - cannot auto-detect diagram type")
         return "class"
 
     prompt = """Look at this UML diagram image carefully.
@@ -68,26 +71,32 @@ Reply with ONLY one word - exactly one of: class, usecase, sequence
 Do not explain. Just the single word."""
 
     payload = json.dumps({
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"inline_data": {"mime_type": mime_type, "data": image_b64}}
-            ]
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
+            ],
         }],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 10}
+        "temperature": 0.0,
+        "max_tokens": 10,
     }).encode("utf-8")
 
     for model in _VISION_MODELS:
-        url = f"{_GEMINI_API_BASE}/{model}:generateContent?key={api_key}"
+        url = f"{_OPENAI_API_BASE}/chat/completions"
         req = urllib.request.Request(
             url, data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
             method="POST",
         )
         try:
             with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
-            text = body["candidates"][0]["content"]["parts"][0]["text"].strip().lower()
+            text = body["choices"][0]["message"]["content"].strip().lower()
             text = re.sub(r"[^a-z]", "", text.split()[0] if text.split() else "")
             if text in ("class", "usecase", "sequence"):
                 _log.info("Auto-detected diagram type: '%s' (model: %s)", text, model)
@@ -124,9 +133,9 @@ def index():
     return jsonify({
         "message": "OOAD Hybrid Validation Engine",
         "status":  "running",
-        "mode":    "Gemini AI (primary) + Rule-Based (fallback)",
+        "mode":    "OpenAI GPT-4o (primary) + Rule-Based (fallback)",
         "features": {
-            "image_auto_detect": "Upload image -> Gemini Vision auto-detects diagram type",
+            "image_auto_detect": "Upload image -> OpenAI Vision auto-detects diagram type",
             "diagram_types":     ["class", "usecase", "sequence"],
         },
         "endpoints": {"/health": "health check", "/validate": "validate diagram", "/extract": "NLP only"}
@@ -138,7 +147,7 @@ def health():
     return jsonify({
         "status":         "ok",
         "message":        "Hybrid Validation Engine is running",
-        "gemini_enabled": bool(_get_api_key()),
+        "openai_enabled": bool(_get_api_key()),
     })
 
 
@@ -232,14 +241,16 @@ def validate():
         gemini_result = validate_with_gemini(scenario, shapes, diagram_type=dtype)
 
     if gemini_result:
-        _log.info("Gemini validation used for '%s' diagram", dtype)
-        gemini_result["validation_mode"] = "gemini"
+        _log.info("OpenAI validation used for '%s' diagram", dtype)
+        gemini_result["validation_mode"] = "openai"
         final_result = gemini_result
     else:
         # Fallback to rule-based
-        _log.warning("Gemini unavailable - rule-based fallback for '%s'", dtype)
+        _log.warning("OpenAI unavailable - rule-based fallback for '%s'", dtype)
         rule_result = rule_validator.validate(extracted, shapes)
-        rule_result["validation_mode"] = "rule-based (Gemini unavailable)"
+        rule_result["validation_mode"] = "rule-based (OpenAI unavailable)"
+        # Rule-based has no auto_fix — set fixable_count to 0
+        rule_result.setdefault("fixable_count", 0)
         final_result = rule_result
 
     return jsonify({
@@ -264,7 +275,7 @@ def extract_only():
 if __name__ == '__main__':
     key = _get_api_key()
     if not key:
-        _log.warning("GEMINI_API_KEY not set - rule-based only. Image auto-detect DISABLED.")
+        _log.warning("OPENAI_API_KEY not set - rule-based only. Image auto-detect DISABLED.")
     else:
-        _log.info("Gemini API key found - AI validation + image auto-detect ENABLED")
+        _log.info("OpenAI API key found - AI validation + image auto-detect ENABLED")
     app.run(debug=True, host='0.0.0.0', port=5000)
