@@ -374,7 +374,21 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: If a class is NOT explicitly mentioned in the scenario, do NOT report MISSING_CLASS.
 - STRICT: Do NOT assume standard/common attributes (like id, name, date) are required unless scenario says so.
 - STRICT: When in doubt about any error, SKIP it — do not report it.
-- STRICT: Check EVERY association arrow for multiplicity on BOTH ends. Report MISSING_MULTIPLICITY if any end is missing a label.
+- STRICT: Check EVERY association arrow for multiplicity on BOTH ends. Report MISSING_MULTIPLICITY as WARNING if ANY end is missing a multiplicity label.
+
+## GENERALIZATION / INHERITANCE ARROW DIRECTION — CRITICAL:
+- In UML, a generalization (inheritance) arrow MUST point FROM child class TO parent class.
+- The arrowhead must be at the PARENT end. Example: Fish → Animal (arrowhead at Animal).
+- Check the 'from' and 'to' fields of every generalization_arrow shape.
+- If 'from' is the PARENT and 'to' is the CHILD → arrow direction is REVERSED → report WRONG_INHERITANCE as ERROR.
+- Example WRONG: from=Animal, to=Fish (arrow points from parent to child) → WRONG_INHERITANCE ERROR.
+- Example CORRECT: from=Fish, to=Animal (arrow points from child to parent) → OK.
+- STRICT: ALWAYS check generalization arrow direction. Do NOT skip this check.
+
+## EMPTY / MISSING LABELS — CRITICAL:
+- If a class shape has an empty, null, or missing 'text'/'label' field → report EMPTY_CLASS_NAME as ERROR.
+- If an arrow has no label where scenario requires one → report accordingly.
+- STRICT: A class with text="" or text=null or text="Class 1" or text="ClassName" (placeholder) → EMPTY_CLASS_NAME ERROR.
 
 ## CLASS NAME vs ATTRIBUTE/METHOD — CRITICAL RULES:
 - A UML class box has 3 sections: TOP = class name, MIDDLE = attributes, BOTTOM = methods.
@@ -840,7 +854,19 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: Do NOT report MISSING_ATTRIBUTE or MISSING_METHOD unless scenario explicitly requires them.
 - STRICT: Do NOT assume standard attributes (id, name, date, etc.) are required unless scenario says so.
 - STRICT: Only report what you can clearly SEE is wrong or missing — when in doubt, SKIP the error.
-- STRICT: Check EVERY association arrow for multiplicity labels on BOTH ends. Report MISSING_MULTIPLICITY if any end is missing.
+- STRICT: Check EVERY association arrow for multiplicity labels on BOTH ends. Report MISSING_MULTIPLICITY as WARNING if any end is missing a multiplicity label.
+
+## GENERALIZATION / INHERITANCE ARROW DIRECTION — CRITICAL (for CLASS diagrams):
+- In UML, a generalization arrow MUST point FROM child TO parent. The hollow arrowhead must be at the PARENT end.
+- LOOK CAREFULLY at every inheritance arrow in the image.
+- If the arrowhead points FROM parent TO child → direction is REVERSED → report WRONG_INHERITANCE as ERROR.
+- Example WRONG: arrow goes Animal→Fish (arrowhead at Fish) → WRONG_INHERITANCE.
+- Example CORRECT: arrow goes Fish→Animal (arrowhead at Animal) → OK.
+- STRICT: Always check generalization arrow direction in every class diagram image.
+
+## EMPTY / MISSING LABELS:
+- If any class box has no visible name → report EMPTY_CLASS_NAME as ERROR.
+- If any class box has a placeholder name like "Class 1" → report EMPTY_CLASS_NAME as ERROR.
 
 ## CLASS NAME vs ATTRIBUTE/METHOD — CRITICAL RULES:
 - A UML class box has 3 sections: TOP = class name, MIDDLE = attributes, BOTTOM = methods.
