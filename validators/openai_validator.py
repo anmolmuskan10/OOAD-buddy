@@ -42,10 +42,10 @@ def _get_api_key() -> Optional[str]:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SHAPE SANITIZER — strips Flutter ToolType prefix, filters by diagram type
-# so Gemini cannot be confused by cross-diagram shape types
+# so OpenAI cannot be confused by cross-diagram shape types
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Flutter ToolType enum value → clean readable name for Gemini
+# Flutter ToolType enum value → clean readable name for OpenAI
 _TOOLTYPE_MAP = {
     "classfullshape":       "class",
     "classshape":           "class",
@@ -113,10 +113,10 @@ def _clean_type(raw_type: str) -> str:
 
 def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
     """
-    Prepare shapes for Gemini:
+    Prepare shapes for OpenAI:
     1. Clean 'type' field — strip ToolType. prefix, map to readable name.
-    2. Remove shapes that don't belong to this diagram type (they confuse Gemini).
-    3. Keep only fields Gemini needs; drop internal Flutter state fields.
+    2. Remove shapes that don't belong to this diagram type (they confuse OpenAI).
+    3. Keep only fields OpenAI needs; drop internal Flutter state fields.
     """
     valid_types = _VALID_TYPES_BY_DIAGRAM.get(diagram_type)
     cleaned = []
@@ -130,7 +130,7 @@ def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
             if not has_conn:
                 continue  # skip this shape — it doesn't belong here
 
-        # Build a minimal, clean dict for Gemini
+        # Build a minimal, clean dict for OpenAI
         entry: Dict[str, Any] = {"type": clean_t}
         for field in ("text", "label", "name", "id", "from", "to",
                       "startLifeline", "endLifeline", "lifelineRef"):
@@ -147,12 +147,12 @@ def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FALLBACK AUTO-FIX BUILDER
-# Jab Gemini fixable: true nahi deta, hum error_type se apna fix banate hain
+# Jab OpenAI fixable: true nahi deta, hum error_type se apna fix banate hain
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_fallback_fix(error_type: str, element: str, raw_error: dict, diagram_type: str) -> dict:
     """
-    Gemini ka auto_fix agar incomplete/missing ho — error_type se fallback fix banao.
+    OpenAI ka auto_fix agar incomplete/missing ho — error_type se fallback fix banao.
     Ye ensure karta hai ke common fixable errors hamesha fixable rahein.
     """
     et = error_type.upper()
@@ -374,7 +374,15 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: If a class is NOT explicitly mentioned in the scenario, do NOT report MISSING_CLASS.
 - STRICT: Do NOT assume standard/common attributes (like id, name, date) are required unless scenario says so.
 - STRICT: When in doubt about any error, SKIP it — do not report it.
-- STRICT: Only report MISSING_MULTIPLICITY if the diagram has associations but multiplicity labels are clearly absent.
+- STRICT: Check EVERY association arrow for multiplicity on BOTH ends. Report MISSING_MULTIPLICITY if any end is missing a label.
+
+## CLASS NAME vs ATTRIBUTE/METHOD — CRITICAL RULES:
+- A UML class box has 3 sections: TOP = class name, MIDDLE = attributes, BOTTOM = methods.
+- STRICT: ONLY the TOP section is the class name. Do NOT treat attribute names or method names as class names.
+- STRICT: Names like 'reviewId', 'staffId', 'patientId', 'staffID' are ATTRIBUTES (middle section) — NOT class names. Never report them as MISSING_CLASS.
+- STRICT: Names ending with () like 'submitreview()', 'login()', 'logout()' are METHODS — NOT classes. Never report them as MISSING_CLASS.
+- STRICT: Do NOT report SPELLING_MISTAKE if the "corrected" name is actually an attribute or method name visible inside the class box. Example: if class is named 'Review' and 'reviewId' is its attribute, do NOT say 'Review' should be renamed to 'Reviewid' — this is WRONG.
+- STRICT: Do NOT confuse camelCase attribute names (reviewId, staffId) with class names even if they look similar to a class name.
 """
 
 
@@ -641,7 +649,7 @@ def _call_model(prompt: str, api_key: str, model: str) -> Optional[Dict]:
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def validate_with_gemini(
+def validate_with_openai(
     scenario:     str,
     shapes:       List[Dict[str, Any]],
     diagram_type: str = "class",
@@ -671,12 +679,12 @@ def validate_with_gemini(
             _log.info("OpenAI model %s succeeded!", model)
             raw_errors = result.get("errors", [])
             score      = int(result.get("score", 50))
-            summary    = result.get("summary", "Gemini validation complete")
+            summary    = result.get("summary", "OpenAI validation complete")
 
             errors, warnings, info = [], [], []
             for e in raw_errors:
                 sev  = str(e.get("severity", "ERROR")).upper()
-                # auto_fix: Gemini se aane wala fix object — Flutter use karega
+                # auto_fix: OpenAI se aane wala fix object — Flutter use karega
                 raw_fix = e.get("auto_fix", {})
                 auto_fix = {
                     "fixable":          bool(raw_fix.get("fixable", False)),
@@ -694,7 +702,7 @@ def validate_with_gemini(
                 error_type = str(e.get("error_type", "UNKNOWN"))
                 element    = str(e.get("element",    ""))
 
-                # ── Fallback: if Gemini didn't return fixable auto_fix, build one ──
+                # ── Fallback: if OpenAI didn't return fixable auto_fix, build one ──
                 if not auto_fix.get("fixable"):
                     auto_fix = _build_fallback_fix(error_type, element, e, diagram_type)
 
@@ -737,7 +745,7 @@ def validate_with_gemini(
 def _build_image_prompt(diagram_type: str, scenario: str) -> str:
     """
     Jab shapes empty ho aur image available ho — image ko directly analyze karo.
-    Shapes ke baghair Gemini ko image dekhni chahiye taake accurately validate kare.
+    Shapes ke baghair OpenAI ko image dekhni chahiye taake accurately validate kare.
     """
     dt = diagram_type.lower()
 
@@ -831,7 +839,16 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: If something is NOT explicitly mentioned in the scenario, do NOT report it as missing.
 - STRICT: Do NOT report MISSING_ATTRIBUTE or MISSING_METHOD unless scenario explicitly requires them.
 - STRICT: Do NOT assume standard attributes (id, name, date, etc.) are required unless scenario says so.
-- STRICT: Only report what you can clearly SEE is wrong or missing — when in doubt, SKIP the error."""
+- STRICT: Only report what you can clearly SEE is wrong or missing — when in doubt, SKIP the error.
+- STRICT: Check EVERY association arrow for multiplicity labels on BOTH ends. Report MISSING_MULTIPLICITY if any end is missing.
+
+## CLASS NAME vs ATTRIBUTE/METHOD — CRITICAL RULES:
+- A UML class box has 3 sections: TOP = class name, MIDDLE = attributes, BOTTOM = methods.
+- STRICT: ONLY the TOP section is the class name. Do NOT treat attribute or method names as class names.
+- STRICT: Names like 'reviewId', 'staffId', 'patientId', 'staffID' visible in the MIDDLE section are ATTRIBUTES — NOT class names. Never report them as MISSING_CLASS.
+- STRICT: Names ending with () like 'submitreview()', 'login()', 'logout()' are METHODS — NOT classes. Never report them as MISSING_CLASS.
+- STRICT: Do NOT report SPELLING_MISTAKE if the "corrected" name is an attribute or method visible inside the class box. Example: class named 'Review' with attribute 'reviewId' — do NOT say 'Review' should be 'Reviewid'. This is WRONG.
+- STRICT: Do NOT confuse camelCase attribute names (reviewId, staffId) with missing class names."""
 
 
 def _call_model_with_image(prompt: str, image_b64: str, mime_type: str, api_key: str, model: str) -> Optional[Dict]:
@@ -898,7 +915,7 @@ def _call_model_with_image(prompt: str, image_b64: str, mime_type: str, api_key:
         return None
 
 
-def validate_with_gemini_image(
+def validate_with_openai_image(
     scenario:     str,
     image_b64:    str,
     mime_type:    str = "image/png",
@@ -978,7 +995,7 @@ def validate_with_gemini_image(
                 "total_issues":    len(raw_errors),
                 "fixable_count":   fixable_count,
                 "source":          "openai-vision",
-                "validation_mode": "gemini",
+                "validation_mode": "openai",
             }
 
     _log.error("All Vision models failed!")
