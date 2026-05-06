@@ -142,13 +142,20 @@ def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
         # Build a minimal, clean dict for Gemini
         entry: Dict[str, Any] = {"type": clean_t}
         for field in ("text", "label", "name", "id", "from", "to",
-                      "startLifeline", "endLifeline", "lifelineRef"):
+                      "startLifeline", "endLifeline", "lifelineRef",
+                      "multiplicity_start", "multiplicity_end",
+                      "relationship_label", "attributes", "methods"):
             val = s.get(field)
             if val is not None and str(val).strip().lower() not in ("", "none", "null", "undefined"):
-                # classFullShape text = "ClassName\n---attrs---\n..." — send only class name
+                # classFullShape text = "ClassName\n---attrs---\n..." — preserve full text for class shapes
+                # but send only class name for the "name" equivalent
                 if field == "text" and "\n" in str(val):
-                    val = str(val).split("\n")[0].strip()
-                entry[field] = val
+                    # Keep full text so LLM can see attributes/methods
+                    entry[field] = val
+                    # Also expose the class name separately
+                    entry["_class_name"] = str(val).split("\n")[0].strip()
+                else:
+                    entry[field] = val
         cleaned.append(entry)
 
     return cleaned
@@ -543,6 +550,67 @@ def _run_rule_checks(shapes: List[Dict], diagram_type: str) -> List[Dict]:
     return []
 
 
+def _existing_relationships(shapes: List[Dict]) -> set:
+    """
+    Return a set of frozensets {norm_from, norm_to} for all drawn arrows.
+    Used to filter hallucinated MISSING_RELATIONSHIP / MISSING_MULTIPLICITY errors.
+    """
+    rels = set()
+    # Accept both raw cleaned types and original type strings
+    arrow_keywords = {
+        "arrow", "association", "dashed", "dotted", "include",
+        "generalization", "composition", "aggregation", "dependency", "line",
+    }
+    for s in shapes:
+        t = str(s.get("type", "")).lower().replace("_", "").replace("-", "")
+        is_arrow = any(kw.replace("_","") in t for kw in arrow_keywords)
+        if not is_arrow:
+            continue
+        frm = _n(str(s.get("from") or s.get("startLifeline") or ""))
+        to  = _n(str(s.get("to")   or s.get("endLifeline")   or ""))
+        if frm and to:
+            rels.add(frozenset({frm, to}))
+    return rels
+
+
+def _existing_multiplicities(shapes: List[Dict]) -> set:
+    """
+    Return frozensets {norm_from, norm_to} for arrows that ALREADY HAVE multiplicity set.
+    An arrow has multiplicity if multiplicity_start OR multiplicity_end is non-empty,
+    OR if the text field has pipe-separated format 'startMult|label|endMult'.
+    """
+    has_mult = set()
+    # Arrow types that can carry multiplicity (association, aggregation, composition)
+    mult_arrow_keywords = {"association", "aggregation", "composition", "arrow", "line"}
+    for s in shapes:
+        t = str(s.get("type", "")).lower().replace("_", "").replace("-", "")
+        is_mult_arrow = any(kw.replace("_","") in t for kw in mult_arrow_keywords)
+        if not is_mult_arrow:
+            continue
+        frm = _n(str(s.get("from") or ""))
+        to  = _n(str(s.get("to")   or ""))
+        if not (frm and to):
+            continue
+
+        m_start = str(s.get("multiplicity_start") or "").strip()
+        m_end   = str(s.get("multiplicity_end")   or "").strip()
+        text    = str(s.get("text") or "").strip()
+
+        # Check pipe-format text: "1|label|*"
+        has_pipe_mult = False
+        if "|" in text:
+            parts = text.split("|")
+            if len(parts) >= 2 and (parts[0].strip() or parts[-1].strip()):
+                has_pipe_mult = True
+
+        if (m_start and m_start.lower() not in ("none", "null", "")) or \
+           (m_end   and m_end.lower()   not in ("none", "null", "")) or \
+           has_pipe_mult:
+            has_mult.add(frozenset({frm, to}))
+
+    return has_mult
+
+
 def _existing_names(shapes: List[Dict]) -> set:
     """All normalized names present in the diagram — for hallucination filtering."""
     names = set()
@@ -550,43 +618,102 @@ def _existing_names(shapes: List[Dict]) -> set:
         n = _n(_shape_name(s))
         if n:
             names.add(n)
+        # Also extract class name from _class_name field
+        cn = _n(str(s.get("_class_name") or ""))
+        if cn:
+            names.add(cn)
     return names
 
 
 def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
                    llm_warnings: List[Dict], llm_info: List[Dict],
-                   clean_shapes: List[Dict], llm_score: int, llm_summary: str) -> Dict:
+                   clean_shapes: List[Dict], llm_score: int, llm_summary: str,
+                   ignored_errors: Optional[List[str]] = None) -> Dict:
     """
     Merge rule-based errors with LLM errors.
     - Rule errors: always trusted (deterministic).
     - LLM errors: filtered to remove hallucinations and capitalisation noise.
+    - ignored_errors: list of error fingerprints that user has dismissed — never re-report them.
     """
     SKIP_FROM_LLM = {
-        "DISCONNECTED_ACTOR", "ISOLATED_USE_CASE",  # rule layer handles these
-        "WRONG_CLASS_CAPITALISATION", "WRONG_CAPITALISATION",
-        "WRONG_ACTOR_CAPITALISATION", "WRONG_USE_CASE_CAPITALISATION",
-        "DUPLICATE_ACTOR", "DUPLICATE_USE_CASE", "DUPLICATE_CLASS",
-        "UNLABELLED_ACTOR", "UNLABELLED_USE_CASE", "UNLABELLED_LIFELINE",
-        "EMPTY_CLASS_NAME",
+        "disconnected_actor", "isolated_use_case",
+        "wrong_class_capitalisation", "wrong_capitalisation",
+        "wrong_actor_capitalisation", "wrong_use_case_capitalisation",
+        "duplicate_actor", "duplicate_use_case", "duplicate_class",
+        "unlabelled_actor", "unlabelled_use_case", "unlabelled_lifeline",
+        "empty_class_name",
     }
 
-    existing = _existing_names(clean_shapes)
-    rule_types_found = {e["error_type"] for e in rule_errors}
+    existing      = _existing_names(clean_shapes)
+    existing_rels = _existing_relationships(clean_shapes)
+    existing_mult = _existing_multiplicities(clean_shapes)
+    ignored_set   = set(ignored_errors or [])
+
+    def _error_fingerprint(e: Dict) -> str:
+        """Unique key for an error — used for ignored_errors matching."""
+        et   = _n(str(e.get("error_type", "")))   # lowercase
+        elem = _n(str(e.get("element", "")))
+        fix  = e.get("auto_fix") or {}
+        frm  = _n(str(fix.get("from_element", "")))
+        to   = _n(str(fix.get("to_element",   "")))
+        return f"{et}|{elem}|{frm}|{to}"
 
     def keep_llm(e):
-        et = str(e.get("error_type", "")).upper()
+        et   = _n(str(e.get("error_type", "")))   # lowercase
         elem = _n(str(e.get("element", "")))
+        fix  = e.get("auto_fix") or {}
+        frm  = _n(str(fix.get("from_element", "")))
+        to   = _n(str(fix.get("to_element",   "")))
+
         # Drop if rule layer already handles this error type
         if et in SKIP_FROM_LLM:
             return False
-        # Drop if LLM says element is MISSING but it exists in shapes (hallucination)
-        if "MISSING" in et and elem and elem in existing:
+
+        # Drop if user has ignored this error previously
+        if _error_fingerprint(e) in ignored_set:
             return False
+
+        # Drop if LLM says element is MISSING but it exists in shapes (hallucination)
+        if "missing" in et and elem and elem in existing:
+            # Allow MISSING_MULTIPLICITY / MISSING_RELATIONSHIP even if element name matches
+            # ONLY if the relationship itself is NOT already in the diagram
+            if et in ("missing_multiplicity", "missing_relationship",
+                      "missing_association_label", "wrong_multiplicity"):
+                if frm and to:
+                    pair = frozenset({frm, to})
+                    if et == "missing_multiplicity":
+                        # Only report if multiplicity is genuinely absent
+                        if pair in existing_mult:
+                            return False  # multiplicity already exists — false positive
+                    elif et in ("missing_relationship", "missing_association_label"):
+                        # Only report if the relationship does NOT exist at all
+                        if pair in existing_rels:
+                            return False  # relationship already drawn — false positive
+                    # wrong_multiplicity: keep it (it's a value correction, not missing)
+                    return True
+            return False  # generic MISSING_X when element exists = hallucination
+
+        # Drop MISSING_MULTIPLICITY if pair already has multiplicity (no from/to in fix)
+        if et == "missing_multiplicity" and frm and to:
+            if frozenset({frm, to}) in existing_mult:
+                return False
+
+        # Drop MISSING_RELATIONSHIP / MISSING_ASSOCIATION_LABEL if relationship already drawn
+        if et in ("missing_relationship", "missing_association_label") and frm and to:
+            if frozenset({frm, to}) in existing_rels:
+                return False
+
         return True
 
     filtered_errors   = [e for e in llm_errors   if keep_llm(e)]
     filtered_warnings = [e for e in llm_warnings if keep_llm(e)]
     filtered_info     = [e for e in llm_info     if keep_llm(e)]
+
+    # Also filter rule errors against ignored set
+    def keep_rule(r):
+        return _error_fingerprint(r) not in ignored_set
+
+    rule_errors_filtered = [r for r in rule_errors if keep_rule(r)]
 
     def to_item(r):
         return {
@@ -598,9 +725,9 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
             "auto_fix":    r.get("auto_fix", {"fixable": False}),
         }
 
-    rule_e = [to_item(r) for r in rule_errors if r.get("severity") == "ERROR"]
-    rule_w = [to_item(r) for r in rule_errors if r.get("severity") == "WARNING"]
-    rule_i = [to_item(r) for r in rule_errors if r.get("severity") == "INFO"]
+    rule_e = [to_item(r) for r in rule_errors_filtered if r.get("severity") == "ERROR"]
+    rule_w = [to_item(r) for r in rule_errors_filtered if r.get("severity") == "WARNING"]
+    rule_i = [to_item(r) for r in rule_errors_filtered if r.get("severity") == "INFO"]
 
     final_errors   = rule_e + filtered_errors
     final_warnings = rule_w + filtered_warnings
@@ -794,8 +921,25 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: If a class "customer" exists and scenario mentions "Customer" → WRONG_CLASS_CAPITALISATION only. Do NOT say remove it. Do NOT say add "Customer" as a new class.
 
 ### MISSING_MULTIPLICITY:
-- STRICT: Only report if an association/aggregation/composition arrow is drawn AND both multiplicity_start and multiplicity_end are empty/missing.
-- STRICT: Check the "text" field for pipe format "startMult|label|endMult" before concluding multiplicity is missing.
+- STRICT: Only report if an association/aggregation/composition arrow is drawn AND BOTH `multiplicity_start` AND `multiplicity_end` fields are empty/null/missing.
+- STRICT: Check the `"text"` field for pipe format `"startMult|label|endMult"` (e.g. `"1|manages|*"`) — if EITHER the first or last segment is non-empty, multiplicity EXISTS and must NOT be reported as missing.
+- STRICT: If `multiplicity_start` OR `multiplicity_end` has any non-empty value → multiplicity IS present → do NOT report MISSING_MULTIPLICITY.
+- STRICT: NEVER report MISSING_MULTIPLICITY for an arrow that has multiplicity_start or multiplicity_end set, even if only one side has a value.
+- STRICT: Do NOT suggest a specific multiplicity value (like "1 to *") unless the scenario explicitly states it.
+
+### WRONG_MULTIPLICITY:
+- STRICT: Only report if multiplicity IS present AND its value clearly contradicts the scenario.
+- STRICT: "1 to many", "1..*", "one to many" are all semantically equivalent — do NOT report mismatch between these.
+- STRICT: If scenario says "one-to-many" and diagram shows "1" to "*" → CORRECT, no error.
+- STRICT: When in doubt about whether a multiplicity value is wrong → SKIP the error.
+
+### MISSING_ATTRIBUTE / MISSING_METHOD:
+- STRICT: ONLY report MISSING_ATTRIBUTE if the scenario EXPLICITLY lists specific attributes for a class (e.g. "Customer has attributes: name, email, phone").
+- STRICT: ONLY report MISSING_METHOD if the scenario EXPLICITLY lists specific methods for a class (e.g. "Order has methods: placeOrder(), cancelOrder()").
+- STRICT: If the scenario does NOT explicitly list attributes/methods for a class → do NOT report any MISSING_ATTRIBUTE or MISSING_METHOD for that class, EVEN IF attributes/methods are commonly expected.
+- STRICT: If the scenario lists attributes/methods AND the user has drawn them → NO error.
+- STRICT: If the scenario does NOT list attributes/methods → NO error, regardless of what user draws.
+- STRICT: Extra attributes/methods that are NOT in the scenario but user adds → NO error (user can add more than scenario requires).
 
 ### MISSING_ASSOCIATION_LABEL:
 - STRICT: Only report if scenario EXPLICITLY mentions what the relationship should be called (e.g. "Bank manages Customer" → label is "manages").
@@ -1209,24 +1353,50 @@ def _call_model(prompt: str, api_key: str, model: str) -> Optional[Dict]:
         return None
 
 
+def make_error_fingerprint(error_type: str, element: str = "",
+                           from_element: str = "", to_element: str = "") -> str:
+    """
+    Generate a stable fingerprint for an error that can be stored by the Flutter app
+    and passed back as ignored_errors on future validate_with_openai() calls.
+
+    Usage (Flutter side):
+        When user taps "Ignore" on an error, call:
+            fingerprint = make_error_fingerprint(
+                error["error_type"],
+                error.get("element",""),
+                error.get("auto_fix",{}).get("from_element",""),
+                error.get("auto_fix",{}).get("to_element",""),
+            )
+        Store fingerprints in a list and pass as ignored_errors next time you validate.
+    """
+    def _n_local(s): return str(s).strip().lower()
+    return f"{_n_local(error_type)}|{_n_local(element)}|{_n_local(from_element)}|{_n_local(to_element)}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
 def validate_with_openai(
-    scenario:     str,
-    shapes:       List[Dict[str, Any]],
-    diagram_type: str = "class",
+    scenario:       str,
+    shapes:         List[Dict[str, Any]],
+    diagram_type:   str = "class",
+    ignored_errors: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Validate any diagram type using OpenAI.
     diagram_type: 'class' | 'usecase' | 'sequence'
+    ignored_errors: list of error fingerprints the user has dismissed
+                    (format: "ERROR_TYPE|element|from_element|to_element", all lowercase).
+                    These errors will NEVER be reported again in this or future validations.
     Returns structured validation result or None.
     """
     api_key = _get_api_key()
     if not api_key:
         _log.warning("OPENAI_API_KEY not set — skipping AI validation")
         return None
+
+    _ignored = [_n(x) for x in (ignored_errors or [])]
 
     # Step 1 — Sanitize shapes
     clean_shapes = _sanitize_shapes(shapes, diagram_type)
@@ -1284,6 +1454,7 @@ def validate_with_openai(
             clean_shapes,
             int(result.get("score", 50)),
             result.get("summary", ""),
+            _ignored,
         )
 
     # LLM failed — return rule-only results
