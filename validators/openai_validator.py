@@ -27,12 +27,12 @@ from typing import List, Dict, Any, Optional
 _log = logging.getLogger(__name__)
 
 _MODELS = [
-    "gpt-4o",
+    "gpt-4o-mini",
 ]
 
 _OPENAI_API_BASE = "https://api.openai.com/v1"
-_TIMEOUT_SECONDS = 60
-_RETRY_WAIT      = 40
+_TIMEOUT_SECONDS = 120
+_RETRY_WAIT      = 65
 
 _SYSTEM_MESSAGE = (
     "You are a strict, deterministic UML diagram validator. "
@@ -1815,7 +1815,7 @@ def validate_with_openai_image(
         return None
 
     # Vision-capable models only
-    vision_models = ["gpt-4o"]
+    vision_models = ["gpt-4o-mini"]
 
     prompt = _build_image_prompt(diagram_type, scenario)
 
