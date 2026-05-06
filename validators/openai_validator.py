@@ -34,6 +34,16 @@ _OPENAI_API_BASE = "https://api.openai.com/v1"
 _TIMEOUT_SECONDS = 60
 _RETRY_WAIT      = 40
 
+# System message — anchors model behaviour; keeps it deterministic + strict
+_SYSTEM_MESSAGE = (
+    "You are a strict, deterministic UML diagram validator. "
+    "You ONLY report errors you are 100% certain about. "
+    "You NEVER flag capitalisation/case differences as structural errors. "
+    "Case-insensitive matching applies to ALL element names. "
+    "You ALWAYS return valid JSON only — no markdown, no prose. "
+    "Same input MUST always produce the same output."
+)
+
 
 def _get_api_key() -> Optional[str]:
     key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -280,6 +290,345 @@ def _guess_arrow_type(text: str, diagram_type: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# RULE-BASED PRE-VALIDATOR
+# Shapes se directly check karo — LLM par depend mat karo basic checks ke liye.
+# Ye layer 100% deterministic hai. LLM sirf scenario-matching ke liye use hoga.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _norm(s: str) -> str:
+    """Normalize a name for case-insensitive comparison."""
+    return str(s).strip().lower()
+
+
+def _get_names(shapes: List[Dict], *types) -> set:
+    """Get normalised names of shapes matching given types."""
+    result = set()
+    for s in shapes:
+        if s.get("type") in types:
+            name = s.get("text") or s.get("label") or s.get("name") or ""
+            n = _norm(name)
+            if n and n not in ("none", "null", "undefined", ""):
+                result.add(n)
+    return result
+
+
+def _rule_check_class(shapes: List[Dict]) -> List[Dict]:
+    """
+    Deterministic rule checks for class diagrams.
+    Returns list of error dicts (same format as LLM errors).
+    Only checks things we can verify from shape data alone — no scenario needed.
+    """
+    errors = []
+    class_names_raw = {}   # norm_name -> original text
+    for s in shapes:
+        if s.get("type") == "class":
+            text = str(s.get("text") or s.get("label") or s.get("name") or "").strip()
+            if not text or _norm(text) in ("none", "null", "undefined", "class 1", "classname"):
+                errors.append({
+                    "error_type": "EMPTY_CLASS_NAME",
+                    "severity": "ERROR",
+                    "element": text or "(unnamed)",
+                    "description": "Class has no name or has a placeholder name.",
+                    "suggestion": "Give this class a meaningful name.",
+                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": "NewClass"},
+                    "_source": "rule",
+                })
+            else:
+                n = _norm(text)
+                if n in class_names_raw:
+                    # duplicate
+                    errors.append({
+                        "error_type": "DUPLICATE_CLASS",
+                        "severity": "ERROR",
+                        "element": text,
+                        "description": f"Class '{text}' appears more than once in the diagram.",
+                        "suggestion": f"Remove the duplicate '{text}' class.",
+                        "auto_fix": {"fixable": True, "action": "merge_shapes", "name": text},
+                        "_source": "rule",
+                    })
+                else:
+                    class_names_raw[n] = text
+
+    # Capitalisation check — WARNING only, not ERROR
+    for n, text in class_names_raw.items():
+        if text and text[0].islower():
+            correct = text[0].upper() + text[1:]
+            errors.append({
+                "error_type": "WRONG_CLASS_CAPITALISATION",
+                "severity": "WARNING",
+                "element": text,
+                "description": f"Class name '{text}' should start with an uppercase letter.",
+                "suggestion": f"Rename '{text}' to '{correct}'.",
+                "auto_fix": {"fixable": True, "action": "rename_shape", "name": correct},
+                "_source": "rule",
+            })
+
+    # Arrow without source/target
+    arrow_types = {"association_arrow", "aggregation_arrow", "composition_arrow",
+                   "generalization_arrow", "dependency_arrow"}
+    for s in shapes:
+        if s.get("type") in arrow_types:
+            frm = _norm(s.get("from") or "")
+            to  = _norm(s.get("to")   or "")
+            if not frm or not to:
+                errors.append({
+                    "error_type": "DISCONNECTED_ARROW",
+                    "severity": "WARNING",
+                    "element": s.get("type", "arrow"),
+                    "description": "A relationship arrow is not connected at both ends.",
+                    "suggestion": "Connect both ends of the arrow to class shapes.",
+                    "auto_fix": {"fixable": False},
+                    "_source": "rule",
+                })
+
+    return errors
+
+
+def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
+    """Deterministic rule checks for use case diagrams."""
+    errors = []
+
+    actor_names   = {}  # norm -> original
+    uc_names      = {}  # norm -> original
+    has_boundary  = False
+
+    for s in shapes:
+        t = s.get("type", "")
+        name = str(s.get("text") or s.get("label") or s.get("name") or "").strip()
+        n = _norm(name)
+
+        if t == "actor":
+            if not n or n in ("none", "null", "undefined", "actor"):
+                errors.append({
+                    "error_type": "UNLABELLED_ACTOR",
+                    "severity": "ERROR",
+                    "element": name or "(unnamed)",
+                    "description": "An actor has no name.",
+                    "suggestion": "Give this actor a meaningful name.",
+                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": "Actor"},
+                    "_source": "rule",
+                })
+            else:
+                if n in actor_names:
+                    errors.append({
+                        "error_type": "DUPLICATE_ACTOR",
+                        "severity": "ERROR",
+                        "element": name,
+                        "description": f"Actor '{name}' appears more than once.",
+                        "suggestion": f"Remove the duplicate '{name}' actor.",
+                        "auto_fix": {"fixable": True, "action": "merge_shapes", "name": name},
+                        "_source": "rule",
+                    })
+                else:
+                    actor_names[n] = name
+
+        elif t == "use_case_oval":
+            if not n or n in ("none", "null", "undefined", "use case"):
+                errors.append({
+                    "error_type": "UNLABELLED_USE_CASE",
+                    "severity": "ERROR",
+                    "element": name or "(unnamed)",
+                    "description": "A use case has no label.",
+                    "suggestion": "Give this use case a descriptive action name.",
+                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": "Use Case"},
+                    "_source": "rule",
+                })
+            else:
+                if n in uc_names:
+                    errors.append({
+                        "error_type": "DUPLICATE_USE_CASE",
+                        "severity": "ERROR",
+                        "element": name,
+                        "description": f"Use case '{name}' appears more than once.",
+                        "suggestion": f"Remove the duplicate '{name}' use case.",
+                        "auto_fix": {"fixable": True, "action": "merge_shapes", "name": name},
+                        "_source": "rule",
+                    })
+                else:
+                    uc_names[n] = name
+
+        elif t == "system_boundary":
+            has_boundary = True
+
+    return errors
+
+
+def _rule_check_sequence(shapes: List[Dict]) -> List[Dict]:
+    """Deterministic rule checks for sequence diagrams."""
+    errors = []
+    lifeline_names = {}  # norm -> original
+
+    for s in shapes:
+        t = s.get("type", "")
+        if t in ("lifeline", "object_lifeline", "actor"):
+            name = str(s.get("text") or s.get("label") or s.get("name") or "").strip()
+            n = _norm(name)
+            if not n or n in ("none", "null", "undefined"):
+                errors.append({
+                    "error_type": "UNLABELLED_LIFELINE" if t != "object_lifeline" else "UNLABELLED_OBJECT",
+                    "severity": "ERROR",
+                    "element": name or "(unnamed)",
+                    "description": "A lifeline/participant has no name.",
+                    "suggestion": "Give this lifeline a meaningful name.",
+                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": "Participant"},
+                    "_source": "rule",
+                })
+            else:
+                if n in lifeline_names:
+                    errors.append({
+                        "error_type": "DUPLICATE_LIFELINE",
+                        "severity": "WARNING",
+                        "element": name,
+                        "description": f"Lifeline '{name}' appears more than once.",
+                        "suggestion": f"Remove the duplicate '{name}' lifeline.",
+                        "auto_fix": {"fixable": True, "action": "merge_shapes", "name": name},
+                        "_source": "rule",
+                    })
+                else:
+                    lifeline_names[n] = name
+
+        elif t in ("arrow", "dashed_arrow", "dotted_arrow", "self_message_arrow"):
+            label = str(s.get("label") or s.get("text") or "").strip()
+            if t != "self_message_arrow" and (_norm(label) in ("", "none", "null", "undefined")):
+                errors.append({
+                    "error_type": "UNLABELLED_ARROW",
+                    "severity": "WARNING",
+                    "element": label or "(unlabelled arrow)",
+                    "description": "A message arrow has no label.",
+                    "suggestion": "Add a meaningful message name to this arrow.",
+                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": "message"},
+                    "_source": "rule",
+                })
+
+    return errors
+
+
+def _run_rule_checks(shapes: List[Dict], diagram_type: str) -> List[Dict]:
+    """Run the appropriate rule-based checks for the diagram type."""
+    dt = diagram_type.lower()
+    if "class" in dt:
+        return _rule_check_class(shapes)
+    elif "usecase" in dt or "use_case" in dt or "use case" in dt:
+        return _rule_check_usecase(shapes)
+    elif "sequence" in dt:
+        return _rule_check_sequence(shapes)
+    return []
+
+
+def _merge_results(rule_errors: List[Dict], llm_result: Dict, diagram_type: str) -> Dict:
+    """
+    Merge rule-based errors with LLM errors.
+    Strategy:
+    - Rule errors are TRUSTED — always include them (they are deterministic).
+    - LLM errors are FILTERED:
+        * Remove any LLM error whose error_type + element already covered by a rule error.
+        * Remove capitalisation errors from LLM (we handle those in rules as WARNING).
+        * Remove LLM errors that contradict rule findings (e.g. LLM says missing X but rules found X).
+    """
+    CASE_ERROR_TYPES = {
+        "WRONG_CLASS_CAPITALISATION", "WRONG_CAPITALISATION",
+        "WRONG_ACTOR_CAPITALISATION", "WRONG_USE_CASE_CAPITALISATION",
+    }
+
+    # Build set of (error_type, norm_element) already covered by rules
+    rule_covered = {
+        (_norm(e["error_type"]), _norm(e["element"]))
+        for e in rule_errors
+    }
+
+    # Names that EXIST in the diagram (from rule checks — shapes are ground truth)
+    existing_names = set()
+    for s in llm_result.get("_clean_shapes", []):
+        for field in ("text", "label", "name"):
+            v = str(s.get(field) or "").strip()
+            if v and _norm(v) not in ("none", "null", "undefined", ""):
+                existing_names.add(_norm(v))
+
+    filtered_llm_errors = []
+    filtered_llm_warnings = []
+    filtered_llm_info = []
+
+    all_llm = (
+        [(e, "ERROR")   for e in llm_result.get("errors",   [])] +
+        [(e, "WARNING") for e in llm_result.get("warnings", [])] +
+        [(e, "INFO")    for e in llm_result.get("info",     [])]
+    )
+
+    for e, default_sev in all_llm:
+        et   = _norm(str(e.get("error_type", "")))
+        elem = _norm(str(e.get("element", "")))
+        sev  = str(e.get("severity", default_sev)).upper()
+
+        # Drop capitalisation errors — rules handle these as WARNING
+        if str(e.get("error_type", "")).upper() in CASE_ERROR_TYPES:
+            continue
+
+        # Drop if already covered by a rule error of same type+element
+        if (et, elem) in rule_covered:
+            continue
+
+        # Drop MISSING_X errors where element actually exists in diagram
+        # (LLM hallucinating missing elements that are present)
+        if et.startswith("missing_") and elem and elem in existing_names:
+            _log.debug("Dropping hallucinated MISSING error: %s for '%s' (element exists)", et, elem)
+            continue
+
+        # Keep it
+        if sev == "WARNING":
+            filtered_llm_warnings.append(e)
+        elif sev == "INFO":
+            filtered_llm_info.append(e)
+        else:
+            filtered_llm_errors.append(e)
+
+    # Convert rule errors to final format
+    def rule_to_item(r):
+        sev = r.get("severity", "ERROR")
+        return {
+            "error_type":  r["error_type"],
+            "severity":    sev,
+            "element":     r["element"],
+            "description": r["description"],
+            "suggestion":  r["suggestion"],
+            "auto_fix":    r.get("auto_fix", {"fixable": False}),
+        }
+
+    rule_errors_formatted   = [rule_to_item(r) for r in rule_errors if r.get("severity") == "ERROR"]
+    rule_warnings_formatted = [rule_to_item(r) for r in rule_errors if r.get("severity") == "WARNING"]
+    rule_info_formatted     = [rule_to_item(r) for r in rule_errors if r.get("severity") == "INFO"]
+
+    final_errors   = rule_errors_formatted   + filtered_llm_errors
+    final_warnings = rule_warnings_formatted + filtered_llm_warnings
+    final_info     = rule_info_formatted     + filtered_llm_info
+
+    all_items = final_errors + final_warnings + final_info
+    fixable_count = sum(1 for i in all_items if i.get("auto_fix", {}).get("fixable"))
+
+    score = llm_result.get("score", 100)
+    if final_errors:
+        # Recalculate score: each ERROR costs more than WARNING
+        deduction = len(final_errors) * 15 + len(final_warnings) * 5
+        score = max(0, min(100, 100 - deduction))
+
+    summary = llm_result.get("summary", "")
+    if not final_errors and not final_warnings and not final_info:
+        summary = "Diagram is correct"
+        score = 100
+
+    return {
+        "is_valid":      len(final_errors) == 0,
+        "score":         score,
+        "summary":       summary,
+        "errors":        final_errors,
+        "warnings":      final_warnings,
+        "info":          final_info,
+        "total_issues":  len(all_items),
+        "fixable_count": fixable_count,
+        "source":        "openai+rules",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PROMPT BUILDERS — alag diagram type ke liye alag prompt
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -344,13 +693,10 @@ Examples of semantically equivalent descriptions:
 - A diagram with classes but NO relationships drawn is valid if the scenario does not describe relationships.
 
 ## CLASS NAME CASE RULES — CRITICAL:
-- Class name matching is CASE-INSENSITIVE. "customer" and "Customer" are the SAME class.
-- NEVER report MISSING_CLASS or EXTRA_CLASS just because of capitalisation differences.
-- If a class name exists with wrong capitalisation (e.g. "customer" vs "Customer"):
-  → You MAY report WRONG_CLASS_CAPITALISATION as WARNING severity only — it is cosmetic, not a structural error.
-  → Suggestion: "Capitalise the first letter: rename 'customer' to 'Customer'."
-  → Do NOT report it as EXTRA_CLASS or say to remove it.
-  → Do NOT also report MISSING_CLASS for the capitalised version — they are the same class.
+- ALL class name matching is CASE-INSENSITIVE. "customer" == "Customer" == "CUSTOMER".
+- NEVER report MISSING_CLASS or EXTRA_CLASS because of capitalisation differences — they are the SAME class.
+- Do NOT report WRONG_CLASS_CAPITALISATION — the rule-based validator handles this separately.
+- Focus ONLY on structural errors: wrong relationships, missing relationships per scenario, wrong multiplicity.
 
 ## MISSING LABEL RULES:
 - If a relationship arrow exists between ClassA and ClassB, and the scenario explicitly names a label for that relationship (e.g. "manages", "contains", "employs"), but the drawn arrow has no label → report MISSING_ASSOCIATION_LABEL.
@@ -429,9 +775,11 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 ## STRICT RULES — MUST FOLLOW:
 - Results must be DETERMINISTIC — same diagram + scenario must always give same errors.
 - Only report issues you are CONFIDENT about. Do NOT invent errors.
-- NEVER flag capitalisation/case differences as structural errors (MISSING_CLASS, EXTRA_CLASS). Use WRONG_CLASS_CAPITALISATION (WARNING) at most.
-- Before including any error, ask yourself: "Am I 100% certain this is wrong?" — if not, SKIP it.
-- Before returning your response, re-read the shapes list and verify each reported error actually exists.
+- ALL name matching is CASE-INSENSITIVE — never flag a name as wrong just because of capitalisation.
+- The rule-based validator already checks: empty names, duplicates, disconnected arrows, capitalisation.
+  Your job is ONLY: scenario-based missing elements, wrong relationship types, wrong multiplicities.
+- Before including ANY error, ask: "Can I see this is wrong in the shapes list?" — if not, SKIP it.
+- A diagram with correct structure but no scenario violations → return empty errors, score 100.
 
 ### MISSING_CLASS:
 - STRICT: Only report for nouns EXPLICITLY written as class names in the scenario.
@@ -493,10 +841,10 @@ This is a USE CASE DIAGRAM. Validate it using ONLY use case diagram rules. Retur
 13. ACTOR_NOT_IN_BOUNDARY — Use cases should be inside system boundary.
 
 ## CASE-INSENSITIVE MATCHING — CRITICAL
-- Use case name matching is CASE-INSENSITIVE. "Login" and "login" are the same use case.
-- Actor name matching is CASE-INSENSITIVE. "Admin" and "admin" are the same actor.
-- NEVER report a use case or actor as wrong/extra just because of capitalisation differences.
-- If capitalisation is wrong (e.g. "login" instead of "Login"), report WRONG_CAPITALISATION with suggestion to capitalise — do NOT report it as EXTRA_USE_CASE or ask to remove it.
+- ALL name matching is CASE-INSENSITIVE. "Login" == "login" == "LOGIN".
+- NEVER report MISSING_ACTOR, MISSING_USE_CASE, or EXTRA_* just because of capitalisation.
+- Do NOT report WRONG_CAPITALISATION — the rule-based validator handles this separately.
+- Your job: check if scenario-required actors/use-cases are present (case-insensitive) and connected.
 
 ## ACTOR CONNECTION — CRITICAL RULES
 - An actor stick-figure occupies vertical space: head at top, body in middle, hands on sides, feet at bottom.
@@ -566,9 +914,11 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 
 ## STRICT VALIDATION RULES — MUST FOLLOW:
 - Only report issues you are CONFIDENT about. Do NOT invent errors.
-- Case/capitalisation differences are NEVER structural errors. Actor/use-case matching is CASE-INSENSITIVE.
-- Before including any error, ask yourself: "Am I 100% certain this is wrong?" — if not, SKIP it.
-- Before returning your response, verify each error against the shapes list.
+- ALL name matching is CASE-INSENSITIVE — never flag a name as missing/wrong due to capitalisation.
+- The rule-based validator already checks: empty names, duplicates, unlabelled shapes.
+  Your job is ONLY: scenario-based missing actors/use-cases, disconnected elements, wrong relationships.
+- Before including ANY error, ask: "Is this element genuinely missing from the shapes list (case-insensitive)?" — if not, SKIP.
+- A diagram with correct structure but no scenario violations → return empty errors, score 100.
 
 ### MISSING_ACTOR hallucination prevention:
 - STRICT: Only report MISSING_ACTOR for persons/systems that are EXPLICITLY written in the scenario.
@@ -747,9 +1097,11 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 ## STRICT RULES — MUST FOLLOW:
 - Results must be DETERMINISTIC — same diagram + scenario must always give the same errors.
 - Only report issues you are CONFIDENT about. Do NOT invent errors.
-- Case/capitalisation differences are NEVER structural errors. Lifeline/message matching is CASE-INSENSITIVE.
-- Before including any error, ask yourself: "Am I 100% certain this is wrong?" — if not, SKIP it.
-- Before returning your response, verify each error against the shapes list.
+- ALL name matching is CASE-INSENSITIVE — never flag a name as missing/wrong due to capitalisation.
+- The rule-based validator already checks: empty names, duplicates, unlabelled arrows.
+  Your job is ONLY: scenario-based missing lifelines/messages, wrong message order, wrong structure.
+- Before including ANY error, ask: "Is this genuinely wrong per the scenario?" — if not, SKIP.
+- A diagram with correct structure but no scenario violations → return empty errors, score 100.
 
 ### MISSING_LIFELINE:
 - STRICT: Only report for participants EXPLICITLY named in the scenario.
@@ -803,22 +1155,13 @@ def _build_prompt(diagram_type: str, scenario: str, shapes: List[Dict]) -> str:
 # HTTP call
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SYSTEM_MESSAGE = (
-    "You are a strict, deterministic UML diagram validator. "
-    "You ONLY report errors you are 100% certain about based on the provided shapes and scenario. "
-    "You NEVER invent errors, never flag capitalisation differences as structural errors, "
-    "and you ALWAYS return valid JSON with no markdown. "
-    "Same input must always produce the same output."
-)
-
-
 def _call_model(prompt: str, api_key: str, model: str) -> Optional[Dict]:
     url = f"{_OPENAI_API_BASE}/chat/completions"
     payload = json.dumps({
         "model": model,
         "messages": [
             {"role": "system", "content": _SYSTEM_MESSAGE},
-            {"role": "user", "content": prompt},
+            {"role": "user",   "content": prompt},
         ],
         "temperature": 0,    # deterministic — prevents errors changing on re-validation
         "seed": 42,          # OpenAI seed for extra determinism
@@ -896,45 +1239,47 @@ def validate_with_openai(
         _log.warning("OPENAI_API_KEY not set — skipping AI validation")
         return None
 
-    # ── Sanitize shapes BEFORE building prompt ────────────────────────────────
-    # This strips ToolType. prefix and removes cross-diagram shapes so OpenAI
-    # doesn't get confused (e.g. actor shapes confusing a class diagram check).
+    # Step 1: Sanitize shapes (strip ToolType prefix, filter cross-diagram shapes)
     clean_shapes = _sanitize_shapes(shapes, diagram_type)
     _log.info("Sanitized shapes: %d → %d (diagram: %s)", len(shapes), len(clean_shapes), diagram_type)
 
+    # Step 2: Run deterministic rule-based checks first
+    # These are 100% reliable — no LLM variance, no hallucinations
+    rule_errors = _run_rule_checks(clean_shapes, diagram_type)
+    _log.info("Rule-based checks found %d issues", len(rule_errors))
+
+    # Step 3: Ask LLM ONLY for scenario-semantic validation
+    # LLM checks: are the right classes/actors/lifelines present per scenario?
+    # Are relationships semantically correct per scenario description?
     prompt = _build_prompt(diagram_type, scenario, clean_shapes)
 
     for model in _MODELS:
         _log.info("Trying OpenAI model: %s (diagram: %s)", model, diagram_type)
-        result = _call_model(prompt, api_key, model)
-        if result:
+        llm_result = _call_model(prompt, api_key, model)
+        if llm_result:
             _log.info("OpenAI model %s succeeded!", model)
-            raw_errors = result.get("errors", [])
-            score      = int(result.get("score", 50))
-            summary    = result.get("summary", "Gemini validation complete")
 
-            errors, warnings, info = [], [], []
+            # Normalize LLM errors into errors/warnings/info lists
+            raw_errors = llm_result.get("errors", [])
+            llm_errors_list, llm_warnings_list, llm_info_list = [], [], []
             for e in raw_errors:
-                sev  = str(e.get("severity", "ERROR")).upper()
-                # auto_fix: Gemini se aane wala fix object — Flutter use karega
+                sev = str(e.get("severity", "ERROR")).upper()
                 raw_fix = e.get("auto_fix", {})
                 auto_fix = {
-                    "fixable":          bool(raw_fix.get("fixable", False)),
-                    "action":           str(raw_fix.get("action",           "")),
-                    "shape_type":       str(raw_fix.get("shape_type",       "")),
-                    "name":             str(raw_fix.get("name",             "")),
-                    "from_element":     str(raw_fix.get("from_element",     "")),
-                    "to_element":       str(raw_fix.get("to_element",       "")),
-                    "arrow_type":       str(raw_fix.get("arrow_type",       "")),
-                    "message_label":    str(raw_fix.get("message_label",    "")),
-                    "multiplicity_from":str(raw_fix.get("multiplicity_from","")),
-                    "multiplicity_to":  str(raw_fix.get("multiplicity_to",  "")),
+                    "fixable":           bool(raw_fix.get("fixable", False)),
+                    "action":            str(raw_fix.get("action",            "")),
+                    "shape_type":        str(raw_fix.get("shape_type",        "")),
+                    "name":              str(raw_fix.get("name",              "")),
+                    "from_element":      str(raw_fix.get("from_element",      "")),
+                    "to_element":        str(raw_fix.get("to_element",        "")),
+                    "arrow_type":        str(raw_fix.get("arrow_type",        "")),
+                    "message_label":     str(raw_fix.get("message_label",     "")),
+                    "multiplicity_from": str(raw_fix.get("multiplicity_from", "")),
+                    "multiplicity_to":   str(raw_fix.get("multiplicity_to",   "")),
                 } if raw_fix else {"fixable": False}
 
                 error_type = str(e.get("error_type", "UNKNOWN"))
                 element    = str(e.get("element",    ""))
-
-                # ── Fallback: if Gemini didn't return fixable auto_fix, build one ──
                 if not auto_fix.get("fixable"):
                     auto_fix = _build_fallback_fix(error_type, element, e, diagram_type)
 
@@ -946,28 +1291,49 @@ def validate_with_openai(
                     "suggestion":  str(e.get("suggestion",  "")),
                     "auto_fix":    auto_fix,
                 }
-                if sev == "WARNING":   warnings.append(item)
-                elif sev == "INFO":    info.append(item)
-                else:                  errors.append(item)
+                if sev == "WARNING": llm_warnings_list.append(item)
+                elif sev == "INFO":  llm_info_list.append(item)
+                else:                llm_errors_list.append(item)
 
-            # Count how many errors are auto-fixable
-            all_items = errors + warnings + info
-            fixable_count = sum(1 for i in all_items if i.get("auto_fix", {}).get("fixable"))
-
-            return {
-                "is_valid":      len(errors) == 0,
-                "score":         score,
-                "summary":       summary,
-                "errors":        errors,
-                "warnings":      warnings,
-                "info":          info,
-                "total_issues":  len(raw_errors),
-                "fixable_count": fixable_count,
-                "source":        "openai",
+            # Step 4: Merge rule results + filtered LLM results
+            normalized_llm = {
+                "errors":        llm_errors_list,
+                "warnings":      llm_warnings_list,
+                "info":          llm_info_list,
+                "score":         int(llm_result.get("score", 50)),
+                "summary":       llm_result.get("summary", ""),
+                "_clean_shapes": clean_shapes,   # passed to merge for hallucination filter
             }
+            return _merge_results(rule_errors, normalized_llm, diagram_type)
 
-    _log.error("All OpenAI models failed!")
-    return None
+    # LLM failed — return rule-based results only (still useful)
+    _log.error("All OpenAI models failed — returning rule-based results only")
+    errors_only   = [r for r in rule_errors if r.get("severity") == "ERROR"]
+    warnings_only = [r for r in rule_errors if r.get("severity") == "WARNING"]
+    info_only     = [r for r in rule_errors if r.get("severity") == "INFO"]
+    all_items     = errors_only + warnings_only + info_only
+    return {
+        "is_valid":      len(errors_only) == 0,
+        "score":         max(0, 100 - len(errors_only) * 15 - len(warnings_only) * 5),
+        "summary":       "Validated using rule-based checks (AI unavailable)",
+        "errors":        [_format_rule_item(r) for r in errors_only],
+        "warnings":      [_format_rule_item(r) for r in warnings_only],
+        "info":          [_format_rule_item(r) for r in info_only],
+        "total_issues":  len(all_items),
+        "fixable_count": sum(1 for r in all_items if r.get("auto_fix", {}).get("fixable")),
+        "source":        "rules-only",
+    }
+
+
+def _format_rule_item(r: Dict) -> Dict:
+    return {
+        "error_type":  r["error_type"],
+        "severity":    r.get("severity", "ERROR"),
+        "element":     r["element"],
+        "description": r["description"],
+        "suggestion":  r["suggestion"],
+        "auto_fix":    r.get("auto_fix", {"fixable": False}),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -993,7 +1359,7 @@ def _build_image_prompt(diagram_type: str, scenario: str) -> str:
 10. MISSING_VERB_IN_USE_CASE — Use case name missing action verb.
 11. DUPLICATE_ACTOR — Same actor name appears twice.
 12. DUPLICATE_USE_CASE — Same use case name appears twice.
-CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisation as missing/extra. Capitalisation differences are NEVER structural errors."""
+CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisation as missing/extra."""
         dtype_label = "USE CASE"
         extra_rules = """
 ## ACTOR CONNECTION RULE:
@@ -1064,9 +1430,6 @@ Look carefully at the ACTUAL IMAGE provided. Validate ONLY what you can SEE.
 - Only report something as MISSING if it is genuinely absent from the image.
 - Do NOT invent errors for things that are present but styled differently than expected.
 - Results must be DETERMINISTIC — same image + scenario must always produce the same errors.
-- NEVER report capitalisation/case differences as structural errors (missing/extra elements).
-- Before each error you include, ask: "Am I 100% certain this is wrong?" — if not, SKIP it.
-- Before returning your final JSON, re-examine the image and verify each reported error is truly visible.
 
 ## SCENARIO
 {scenario}
