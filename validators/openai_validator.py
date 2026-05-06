@@ -1050,7 +1050,7 @@ DO NOT CHECK AND DO NOT REPORT:
   → Suggestion: "Change the system boundary name from 'X' to 'Y'." (never say "add a new boundary")
 - If system boundary does NOT exist at all → report MISSING_SYSTEM_BOUNDARY.
 - If system boundary exists with correct name → no error.
-- STRICT: Name matching is 100% CASE-INSENSITIVE and ignores extra spaces. 'Online Shopping System' == 'online shopping system' == 'ONLINE SHOPPING SYSTEM' — these are ALL the same. Do NOT report WRONG_SYSTEM_BOUNDARY_NAME for case differences only.
+- STRICT: Name matching is 100% CASE-INSENSITIVE and ignores extra spaces. 'Online Shopping System' == 'online shopping system' — these are the SAME. Do NOT report WRONG_SYSTEM_BOUNDARY_NAME for case differences only.
 
 ## SEVERITY
 ERROR = must fix | WARNING = should fix | INFO = suggestion
