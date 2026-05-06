@@ -655,6 +655,13 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
         "duplicate_actor", "duplicate_use_case", "duplicate_class",
         "unlabelled_actor", "unlabelled_use_case", "unlabelled_lifeline",
         "empty_class_name",
+        # Self-referential / actor-connection hallucinations
+        "self_referential_relationship", "incorrect_self_referential_relationship",
+        "self_referential", "incorrect_self_reference",
+        "incorrect_relationship", "incorrect_actor_relationship",
+        "actor_self_relationship", "invalid_relationship",
+        # WRONG_MULTIPLICITY: LLM flip-flops between two valid values — skip entirely.
+        "wrong_multiplicity",
     }
 
     existing      = _existing_names(clean_shapes)
@@ -685,6 +692,19 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
         # Drop if user has ignored this error previously
         if _error_fingerprint(e) in ignored_set:
             return False
+
+        # Drop any relationship error where both endpoints are actors in the diagram
+        # (LLM hallucinates self-referential or actor-actor errors from spatial arrow lines)
+        if frm and to and frm == to:
+            # Self-referential: from and to are the same element — always a hallucination for actors
+            actor_names = {_n(_shape_name(s)) for s in clean_shapes if s.get("type") == "actor"}
+            if frm in actor_names:
+                return False
+
+        if frm and to and frm != to:
+            actor_names = {_n(_shape_name(s)) for s in clean_shapes if s.get("type") == "actor"}
+            if frm in actor_names and to in actor_names:
+                return False  # actor-to-actor relationship — always a hallucination
 
         # Drop WRONG_SYSTEM_BOUNDARY_NAME if the names differ only by case
         if et == "wrong_system_boundary_name":
@@ -985,10 +1005,9 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: Do NOT suggest a specific multiplicity value (like "1 to *") unless the scenario explicitly states it.
 
 ### WRONG_MULTIPLICITY:
-- STRICT: Only report if multiplicity IS present AND its value clearly contradicts the scenario.
-- STRICT: "1 to many", "1..*", "one to many" are all semantically equivalent — do NOT report mismatch between these.
-- STRICT: If scenario says "one-to-many" and diagram shows "1" to "*" → CORRECT, no error.
-- STRICT: When in doubt about whether a multiplicity value is wrong → SKIP the error.
+- STRICT: Do NOT report WRONG_MULTIPLICITY at all. This check is disabled.
+- STRICT: Even if multiplicity values seem incorrect, DO NOT report WRONG_MULTIPLICITY.
+- STRICT: Multiplicity correctness is validated separately — skip all WRONG_MULTIPLICITY checks entirely.
 
 ### MISSING_ATTRIBUTE / MISSING_METHOD:
 - STRICT: ONLY report MISSING_ATTRIBUTE if the scenario EXPLICITLY lists specific attributes for a class (e.g. "Customer has attributes: name, email, phone").
@@ -1046,6 +1065,10 @@ DO NOT CHECK AND DO NOT REPORT:
 - DUPLICATE_ACTOR / DUPLICATE_USE_CASE (handled by rule system)
 - UNLABELLED_ACTOR / UNLABELLED_USE_CASE (handled by rule system)
 - Any capitalisation errors — case differences are NEVER errors
+- SELF_REFERENTIAL_RELATIONSHIP or any self-referential error for actors — NEVER report these
+- INCORRECT_RELATIONSHIP between two actors — actor-to-actor relationships are NEVER an error in use case diagrams
+- INCORRECT_RELATIONSHIP or INVALID_RELATIONSHIP of any kind — these error types do not exist in use case diagrams
+- WRONG_MULTIPLICITY — multiplicity does not apply to use case diagrams
 
 ## CASE-INSENSITIVE MATCHING — ABSOLUTE RULE
 - ALL name matching is 100% CASE-INSENSITIVE.
