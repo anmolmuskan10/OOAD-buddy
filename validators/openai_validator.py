@@ -43,24 +43,6 @@ _SYSTEM_MESSAGE = (
     "Return valid JSON only — no markdown, no prose."
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# IMMUTABLE VALIDATION RULES VERSION
-# This constant locks the validation logic. Every prompt includes this hash so
-# the LLM always applies the EXACT same rule set across all validations and
-# re-validation/debug cycles. Never change this value — bump only if rules
-# intentionally change (and update all prompts accordingly).
-# ─────────────────────────────────────────────────────────────────────────────
-_RULES_VERSION = "UML-VALIDATOR-RULES-v1.0-FROZEN"
-
-_RULES_VERSION_BLOCK = (
-    f"\n## VALIDATION RULES VERSION: {_RULES_VERSION}\n"
-    "CRITICAL: These rules are FIXED and IMMUTABLE. Apply EXACTLY these rules every time — "
-    "on first validation, re-validation, and every debug cycle. "
-    "Do NOT add, remove, or modify any rule between runs. "
-    "Do NOT introduce new error types not listed below. "
-    "The rule set below is the COMPLETE and FINAL list — nothing else is valid.\n"
-)
-
 
 def _get_api_key() -> Optional[str]:
     key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -192,13 +174,6 @@ def _build_fallback_fix(error_type: str, element: str, raw_error: dict, diagram_
     et = error_type.upper()
     desc = str(raw_error.get("description", "")).lower()
     suggestion = str(raw_error.get("suggestion", ""))
-
-    if "SPELLING_MISTAKE" in et:
-        import re as _re
-        # Extract the corrected name from suggestion: "Rename 'X' to 'Y'"
-        m = _re.search(r"[Rr]ename '([^']+)' to '([^']+)'", suggestion)
-        correct_name = m.group(2) if m else element
-        return {"fixable": True, "action": "rename_shape", "name": correct_name}
 
     # ── CLASS DIAGRAM ─────────────────────────────────────────────────────────
     if "MISSING_CLASS" in et:
@@ -398,18 +373,18 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
         if t == "actor":
             if not n:
                 errors.append({
-                    "error_type": "EMPTY_ACTOR_NAME", "severity": "ERROR",
+                    "error_type": "UNLABELLED_ACTOR", "severity": "ERROR",
                     "element": "(unnamed actor)",
-                    "description": "An actor shape has been added but its name is empty. Every actor must have a meaningful name (e.g. 'Customer', 'Admin').",
-                    "suggestion": "Click the actor and type a name for it, e.g. 'Customer' or 'Admin'.",
+                    "description": "An actor has no name.",
+                    "suggestion": "Give this actor a meaningful name.",
                     "auto_fix": {"fixable": True, "action": "rename_shape", "name": "Actor"},
                 })
             elif n in actors:
                 errors.append({
                     "error_type": "DUPLICATE_ACTOR", "severity": "ERROR",
                     "element": name,
-                    "description": f"Actor '{name}' appears more than once in the diagram. Each actor should appear only once.",
-                    "suggestion": f"Remove the duplicate '{name}' actor — keep only one.",
+                    "description": f"Actor '{name}' appears more than once.",
+                    "suggestion": f"Remove the duplicate '{name}' actor.",
                     "auto_fix": {"fixable": True, "action": "merge_shapes", "name": name},
                 })
             else:
@@ -418,29 +393,62 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
         elif t == "use_case_oval":
             if not n:
                 errors.append({
-                    "error_type": "EMPTY_USE_CASE_NAME", "severity": "ERROR",
+                    "error_type": "UNLABELLED_USE_CASE", "severity": "ERROR",
                     "element": "(unnamed use case)",
-                    "description": "A use case oval has been added but its label is empty. Every use case must have an action name (e.g. 'Login', 'Place Order').",
-                    "suggestion": "Click the use case oval and type an action name using Verb+Noun format, e.g. 'Place Order' or 'Login'.",
+                    "description": "A use case has no label.",
+                    "suggestion": "Give this use case a descriptive action name.",
                     "auto_fix": {"fixable": True, "action": "rename_shape", "name": "Use Case"},
                 })
             elif n in use_cases:
                 errors.append({
                     "error_type": "DUPLICATE_USE_CASE", "severity": "ERROR",
                     "element": name,
-                    "description": f"Use case '{name}' appears more than once in the diagram. Each use case should appear only once.",
-                    "suggestion": f"Remove the duplicate '{name}' use case — keep only one.",
+                    "description": f"Use case '{name}' appears more than once.",
+                    "suggestion": f"Remove the duplicate '{name}' use case.",
                     "auto_fix": {"fixable": True, "action": "merge_shapes", "name": name},
                 })
             else:
                 use_cases[n] = name
 
-    # NOTE: DISCONNECTED_ACTOR and ISOLATED_USE_CASE checks are intentionally removed here.
-    # Flutter shapes use spatial positioning (position + endPosition) for connections —
-    # they do NOT have from/to fields. So _build_connection_map() always returns an empty
-    # map for Flutter diagrams, causing false DISCONNECTED_ACTOR / ISOLATED_USE_CASE errors.
-    # Connection checking is handled correctly by UseCaseValidator (usecase_validator.py)
-    # which uses spatial proximity (_line_touches). Do NOT add it back here.
+    # Build connection map from arrow shapes
+    conn = _build_connection_map(shapes)
+
+    # Check: every actor must connect to at least one use case
+    for n, orig in actors.items():
+        actor_conns = conn.get(n, set())
+        # Check if any connection target is a use case
+        connected_to_uc = any(target in use_cases for target in actor_conns)
+        if not connected_to_uc:
+            errors.append({
+                "error_type": "DISCONNECTED_ACTOR", "severity": "ERROR",
+                "element": orig,
+                "description": f"Actor '{orig}' is not connected to any use case.",
+                "suggestion": f"Draw an association line from '{orig}' to at least one use case.",
+                "auto_fix": {
+                    "fixable": True, "action": "add_arrow",
+                    "from_element": orig,
+                    "to_element": next((use_cases[k] for k in use_cases), ""),
+                    "arrow_type": "association",
+                },
+            })
+
+    # Check: every use case must connect to at least one actor
+    for n, orig in use_cases.items():
+        uc_conns = conn.get(n, set())
+        connected_to_actor = any(target in actors for target in uc_conns)
+        if not connected_to_actor:
+            errors.append({
+                "error_type": "ISOLATED_USE_CASE", "severity": "ERROR",
+                "element": orig,
+                "description": f"Use case '{orig}' is not connected to any actor.",
+                "suggestion": f"Connect '{orig}' to at least one actor.",
+                "auto_fix": {
+                    "fixable": True, "action": "add_arrow",
+                    "from_element": next((actors[k] for k in actors), ""),
+                    "to_element": orig,
+                    "arrow_type": "association",
+                },
+            })
 
     return errors
 
@@ -454,16 +462,13 @@ def _rule_check_class(shapes: List[Dict]) -> List[Dict]:
         if s.get("type") != "class":
             continue
         name = _shape_name(s)
-        # For class shapes, extract only the class name (first line before \n)
-        if "\n" in name:
-            name = name.split("\n")[0].strip()
         n    = _n(name)
-        if not n or n in ("class 1", "classname", "class", "newclass"):
+        if not n or n in ("class 1", "classname", "class"):
             errors.append({
                 "error_type": "EMPTY_CLASS_NAME", "severity": "ERROR",
-                "element": name or "(unnamed class)",
-                "description": f"A class shape has been added but its name is empty or has a placeholder name '{name or 'unnamed'}'. Every class must have a proper noun name (e.g. 'Customer', 'Order').",
-                "suggestion": "Click the class and replace the placeholder name with a proper class name from your scenario, e.g. 'Customer' or 'Order'.",
+                "element": name or "(unnamed)",
+                "description": "Class has no name or has a placeholder name.",
+                "suggestion": "Give this class a meaningful name.",
                 "auto_fix": {"fixable": True, "action": "rename_shape", "name": "NewClass"},
             })
         elif n in class_names:
@@ -500,16 +505,13 @@ def _rule_check_sequence(shapes: List[Dict]) -> List[Dict]:
             continue
         name = _shape_name(s)
         n    = _n(name)
-        is_object = t in ("object_lifeline", "object")
-        shape_label = "object" if is_object else "lifeline"
         if not n:
             errors.append({
-                "error_type": "EMPTY_OBJECT_NAME" if is_object else "EMPTY_LIFELINE_NAME",
-                "severity": "ERROR",
-                "element": f"(unnamed {shape_label})",
-                "description": f"A {shape_label} has been added but its name is empty. Every {shape_label} must have a participant name (e.g. 'User', 'Database').",
-                "suggestion": f"Click the {shape_label} and type a participant name, e.g. 'User' or 'Database'.",
-                "auto_fix": {"fixable": True, "action": "rename_shape", "name": "Object" if is_object else "Participant"},
+                "error_type": "UNLABELLED_LIFELINE", "severity": "ERROR",
+                "element": "(unnamed)",
+                "description": "A lifeline has no name.",
+                "suggestion": "Give this lifeline a meaningful name.",
+                "auto_fix": {"fixable": True, "action": "rename_shape", "name": "Participant"},
             })
         elif n in lifelines:
             errors.append({
@@ -639,8 +641,7 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
         "wrong_actor_capitalisation", "wrong_use_case_capitalisation",
         "duplicate_actor", "duplicate_use_case", "duplicate_class",
         "unlabelled_actor", "unlabelled_use_case", "unlabelled_lifeline",
-        "empty_class_name", "empty_actor_name", "empty_use_case_name",
-        "empty_lifeline_name", "empty_object_name",
+        "empty_class_name",
     }
 
     existing      = _existing_names(clean_shapes)
@@ -708,49 +709,31 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
     filtered_warnings = [e for e in llm_warnings if keep_llm(e)]
     filtered_info     = [e for e in llm_info     if keep_llm(e)]
 
+    # Spelling mistake dedup: if a SPELLING_MISTAKE is reported for an element,
+    # suppress any MISSING_* or EXTRA_* error for that same element — only ONE error allowed.
+    _spelled_elements = set()
+    for _e in filtered_errors + filtered_warnings + filtered_info:
+        if _n(str(_e.get("error_type", ""))) == "spelling_mistake":
+            _spelled_elements.add(_n(str(_e.get("element", ""))))
+
+    def _not_dup_spelling(e):
+        et   = _n(str(e.get("error_type", "")))
+        elem = _n(str(e.get("element", "")))
+        if et == "spelling_mistake":
+            return True
+        if elem in _spelled_elements and ("missing" in et or "extra" in et):
+            return False
+        return True
+
+    filtered_errors   = [e for e in filtered_errors   if _not_dup_spelling(e)]
+    filtered_warnings = [e for e in filtered_warnings if _not_dup_spelling(e)]
+    filtered_info     = [e for e in filtered_info     if _not_dup_spelling(e)]
+
     # Also filter rule errors against ignored set
     def keep_rule(r):
         return _error_fingerprint(r) not in ignored_set
 
     rule_errors_filtered = [r for r in rule_errors if keep_rule(r)]
-
-    # ── SPELLING MISTAKE DEDUPLICATION ────────────────────────────────────────
-    # If a SPELLING_MISTAKE_* error exists for an element, suppress all other
-    # errors (MISSING_*, EXTRA_*, etc.) for that same element so only ONE error
-    # is shown: the spelling mistake.  This applies across rule + LLM errors.
-    def _collect_spelling_elements(error_list):
-        """Return set of normalized element names that have a spelling mistake error."""
-        misspelled = set()
-        for e in error_list:
-            if str(e.get("error_type", "")).upper().startswith("SPELLING_MISTAKE"):
-                el = _n(str(e.get("element", "")))
-                if el:
-                    misspelled.add(el)
-                # Also capture the 'wrong' name from auto_fix if present
-                fix = e.get("auto_fix") or {}
-                name = _n(str(fix.get("name", "")))
-                if name:
-                    misspelled.add(name)
-        return misspelled
-
-    all_combined = rule_errors_filtered + filtered_errors + filtered_warnings + filtered_info
-    spelling_elements = _collect_spelling_elements(all_combined)
-
-    def _suppress_if_spelling(e):
-        """Return False (drop) if this error is about an element already covered by SPELLING_MISTAKE."""
-        et = str(e.get("error_type", "")).upper()
-        if et.startswith("SPELLING_MISTAKE"):
-            return True  # always keep the spelling mistake itself
-        el = _n(str(e.get("element", "")))
-        if el and el in spelling_elements:
-            return False  # suppress — spelling mistake covers this element
-        return True
-
-    rule_errors_filtered  = [r for r in rule_errors_filtered  if _suppress_if_spelling(r)]
-    filtered_errors       = [e for e in filtered_errors        if _suppress_if_spelling(e)]
-    filtered_warnings     = [e for e in filtered_warnings      if _suppress_if_spelling(e)]
-    filtered_info         = [e for e in filtered_info          if _suppress_if_spelling(e)]
-    # ─────────────────────────────────────────────────────────────────────────
 
     def to_item(r):
         return {
@@ -801,7 +784,7 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
 
 def _prompt_class(scenario: str, shapes: List[Dict]) -> str:
     return f"""You are an expert UML Class Diagram validator using SEMANTIC analysis.
-{_RULES_VERSION_BLOCK}
+
 ## TASK
 This is a CLASS DIAGRAM. Validate it using ONLY class diagram rules. Return ONLY valid JSON.
 
@@ -845,14 +828,6 @@ This is a CLASS DIAGRAM. Validate it using ONLY class diagram rules. Return ONLY
 - If scenario says "has" / "uses" / "is related to" / "is associated with" → expect ASSOCIATION
 - Wrong type drawn → report WRONG_RELATIONSHIP_TYPE
 
-## SPELLING MISTAKE RULES — CRITICAL
-When a class name in the diagram looks like a misspelled version of a scenario noun:
-- Report error_type: "SPELLING_MISTAKE_CLASS"
-- Description must say: "Spelling mistake: '[wrong]' appears to be a misspelling of '[correct]' from the scenario."
-- Suggestion must say: "Rename '[wrong]' to '[correct]' to match the scenario."
-- Do NOT say "word not found in scenario" — say it is a spelling mistake.
-- Only flag if clearly a typo (e.g. 'Custmer' → 'Customer', 'Oder' → 'Order').
-
 ## SEMANTIC ANALYSIS — READ THIS CAREFULLY:
 You must use SEMANTIC reasoning, not just keyword matching. Different students describe the same correct diagram in different ways. A diagram is valid if its OVERALL LOGIC matches the scenario's intent, even if exact wording differs.
 
@@ -874,6 +849,17 @@ Examples of semantically equivalent descriptions:
   → Do NOT report it as MISSING_CLASS for the correctly-capitalised version.
 - Class names MUST start with an uppercase letter in UML. Lowercase first letter = capitalisation error only.
 
+## SPELLING MISTAKE RULES — CRITICAL:
+- If a class name in the diagram looks like a misspelling of a class name in the scenario (e.g. "Custmer" vs "Customer", "Odrr" vs "Order"):
+  → Report EXACTLY ONE error of type SPELLING_MISTAKE.
+  → element: the misspelled name as drawn.
+  → description: "Class name 'X' appears to be a misspelling of 'Y' from the scenario."
+  → suggestion: "Try changing 'X' to 'Y'."
+  → auto_fix: fixable: true, action: rename_shape, name: <correct spelling from scenario>
+  → Do NOT ALSO report it as MISSING_CLASS for the correctly-spelled version.
+  → Do NOT ALSO report it as EXTRA_CLASS for the misspelled version.
+  → ONE error only — either SPELLING_MISTAKE or MISSING_CLASS, never both for the same element.
+
 ## MISSING LABEL RULES:
 - If a relationship arrow exists between ClassA and ClassB, and the scenario explicitly names a label for that relationship (e.g. "manages", "contains", "employs"), but the drawn arrow has no label → report MISSING_ASSOCIATION_LABEL.
 - Description should say: "The relationship between 'ClassA' and 'ClassB' should have the label 'X' as described in the scenario."
@@ -894,6 +880,7 @@ Examples of semantically equivalent descriptions:
 11. CIRCULAR_INHERITANCE      — A inherits B and B inherits A.
 12. EMPTY_CLASS_NAME          — Class has no name or placeholder like "Class 1".
 13. SELF_ASSOCIATION          — Class connected to itself (warn unless scenario says so).
+14. SPELLING_MISTAKE          — A class name closely resembles a scenario class name but is misspelled (e.g. "Custmer" instead of "Customer"). ONE error only — do NOT also report MISSING_CLASS or EXTRA_CLASS for the same element.
 
 ## SEVERITY
 ERROR = must fix | WARNING = should fix | INFO = suggestion
@@ -924,6 +911,7 @@ AUTO-FIX RULES:
 - CIRCULAR_INHERITANCE → fixable: false
 - EXTRA_CLASS → fixable: false
 - SELF_ASSOCIATION → fixable: false
+- SPELLING_MISTAKE → fixable: true, action: rename_shape, name: <correct spelling from scenario>
 
 ## RESPONSE FORMAT (JSON only, no markdown)
 {{
@@ -956,6 +944,7 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: Only report for nouns EXPLICITLY written as class names in the scenario.
 - STRICT: Method names like "submitOrder()" are METHODS, never classes.
 - STRICT: Attribute names like "orderId", "price" are ATTRIBUTES, never classes.
+- STRICT: If a class name in the diagram is a close misspelling of a scenario class → report SPELLING_MISTAKE ONLY, NOT MISSING_CLASS.
 
 ### MISSING_RELATIONSHIP:
 - STRICT: Only report if scenario EXPLICITLY uses trigger words: has, contains, inherits, is a type of, consists of, is composed of, manages, holds, etc.
@@ -993,13 +982,12 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 ### General:
 - STRICT: When in doubt about ANY error, SKIP it.
 - STRICT: Use semantic understanding — a diagram correct in logic is correct even if wording differs.
-- STRICT: If you report a SPELLING_MISTAKE_CLASS for an element, do NOT also report MISSING_CLASS or EXTRA_CLASS for the same element. ONE error only — the spelling mistake.
 """
 
 
 def _prompt_usecase(scenario: str, shapes: List[Dict]) -> str:
     return f"""You are an expert UML Use Case Diagram validator.
-{_RULES_VERSION_BLOCK}
+
 ## TASK
 This is a USE CASE DIAGRAM. Validate it using ONLY use case diagram rules. Return ONLY valid JSON.
 
@@ -1014,15 +1002,6 @@ This is a USE CASE DIAGRAM. Validate it using ONLY use case diagram rules. Retur
 ## DIAGRAM SHAPES
 {json.dumps(shapes, indent=2)}
 
-## SPELLING MISTAKE RULES — CRITICAL
-When a name in the diagram looks like a misspelled version of a scenario word:
-- Report error_type: "SPELLING_MISTAKE_ACTOR" (for actors) or "SPELLING_MISTAKE_USE_CASE" (for use cases)
-- Description must say: "Spelling mistake: '[wrong]' appears to be a misspelling of '[correct]' from the scenario."
-- Suggestion must say: "Rename '[wrong]' to '[correct]' to match the scenario."
-- Do NOT say "word not found in scenario" — say it is a spelling mistake.
-- Only flag if the diagram name is clearly a typo of a scenario word (e.g. 'Cutomer' → 'Customer', 'Plaec Order' → 'Place Order').
-- Do NOT flag if the name is intentionally different or has a different meaning.
-
 ## RULES TO CHECK (use case diagram ONLY)
 YOUR JOB: Only check scenario-based completeness. Connection checking and duplicate/empty name
 checking is done by a separate rule-based system — do NOT repeat those checks.
@@ -1036,6 +1015,7 @@ checking is done by a separate rule-based system — do NOT repeat those checks.
 5. MISSING_SYSTEM_BOUNDARY — No system boundary rectangle exists in the diagram at all.
 6. WRONG_SYSTEM_BOUNDARY_NAME — Boundary exists but label does not match scenario system name.
 7. WRONG_RELATIONSHIP — include/extend/generalization used incorrectly per scenario.
+8. SPELLING_MISTAKE   — An actor or use case name closely resembles a scenario name but is misspelled (e.g. "Custmer" instead of "Customer"). ONE error only — do NOT also report MISSING_ACTOR/MISSING_USE_CASE or EXTRA_ACTOR/EXTRA_USE_CASE for the same element.
 
 DO NOT CHECK AND DO NOT REPORT:
 - DISCONNECTED_ACTOR (handled by rule system)
@@ -1086,6 +1066,7 @@ AUTO-FIX RULES:
 - EXTRA_ACTOR / EXTRA_USE_CASE → fixable: false (user may have added intentionally)
 - WRONG_RELATIONSHIP → fixable: false (user must review relationship semantics)
 - ACTOR_NOT_IN_BOUNDARY → fixable: false (requires layout restructuring)
+- SPELLING_MISTAKE → fixable: true, action: rename_shape, name: <correct spelling from scenario>
 
 ## RESPONSE FORMAT (JSON only, no markdown)
 {{
@@ -1117,12 +1098,14 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: Only report MISSING_ACTOR for persons/systems that are EXPLICITLY written in the scenario.
 - STRICT: Do NOT invent actors that are implied but not written.
 - STRICT: A single actor is enough if scenario mentions only one person/system.
+- STRICT: If an actor name in the diagram is a close misspelling of a scenario actor → report SPELLING_MISTAKE ONLY, NOT MISSING_ACTOR.
 
 ### MISSING_USE_CASE hallucination prevention:
 - STRICT: Only report MISSING_USE_CASE for actions that are EXPLICITLY written in the scenario.
 - STRICT: Do NOT split one use case into multiple — if scenario says "login", do NOT also require "validate credentials", "check password" etc.
 - STRICT: Do NOT invent sub-use-cases that are not written in the scenario.
 - STRICT: Matching is CASE-INSENSITIVE — "Login" and "login" are the same use case.
+- STRICT: If a use case name in the diagram is a close misspelling of a scenario use case → report SPELLING_MISTAKE ONLY, NOT MISSING_USE_CASE.
 
 ### DISCONNECTED_ACTOR hallucination prevention:
 - STRICT: A line touching the actor's body, torso, or any limb area = CONNECTED. Do NOT report DISCONNECTED_ACTOR for such actors.
@@ -1140,13 +1123,12 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: When in doubt about ANY error, SKIP it — do not report it.
 - STRICT: Do NOT assume actors or use cases that are implied but not written in scenario.
 - STRICT: Results must be DETERMINISTIC — same diagram + scenario must always produce the same errors.
-- STRICT: If you report a SPELLING_MISTAKE_ACTOR or SPELLING_MISTAKE_USE_CASE for an element, do NOT also report MISSING_ACTOR, EXTRA_ACTOR, MISSING_USE_CASE, or EXTRA_USE_CASE for that same element. ONE error only — the spelling mistake.
 """
 
 
 def _prompt_sequence(scenario: str, shapes: List[Dict]) -> str:
     return f"""You are an expert UML Sequence Diagram validator using SEMANTIC analysis.
-{_RULES_VERSION_BLOCK}
+
 ## TASK
 This is a SEQUENCE DIAGRAM. Validate it using ONLY sequence diagram rules. Return ONLY valid JSON.
 
@@ -1190,14 +1172,6 @@ This is a SEQUENCE DIAGRAM. Validate it using ONLY sequence diagram rules. Retur
 
 ### Combined fragments:
 - Types: `combined_fragment`, `fragment` → alt/opt/loop/par boxes.
-
-## SPELLING MISTAKE RULES — CRITICAL
-When a lifeline/object name in the diagram looks like a misspelled version of a scenario participant:
-- Report error_type: "SPELLING_MISTAKE_LIFELINE"
-- Description must say: "Spelling mistake: '[wrong]' appears to be a misspelling of '[correct]' from the scenario."
-- Suggestion must say: "Rename '[wrong]' to '[correct]' to match the scenario."
-- Do NOT say "word not found in scenario" — say it is a spelling mistake.
-- Only flag if clearly a typo (e.g. 'Databse' → 'Database', 'Usr' → 'User').
 
 ## SEMANTIC ANALYSIS — READ THIS CAREFULLY:
 You must use SEMANTIC reasoning. Different students may label messages differently but mean the same thing. A diagram is correct if its overall interaction logic matches the scenario's intent.
@@ -1244,6 +1218,7 @@ Examples:
 12. MISSING_DELETION_SYMBOL — Specific lifeline has no X/destroy marker at its end.
 13. UNLABELLED_ARROW        — Message arrow has no label/name.
 14. MISSING_ALT_FRAGMENT    — Conditional logic in scenario not shown as alt/opt fragment.
+15. SPELLING_MISTAKE        — A lifeline/object/actor name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_LIFELINE or EXTRA_LIFELINE for the same element.
 
 ## SEVERITY
 ERROR = must fix | WARNING = should fix | INFO = suggestion
@@ -1272,6 +1247,7 @@ AUTO-FIX RULES:
 - INVALID_MESSAGE_SOURCE / INVALID_MESSAGE_TARGET → fixable: false
 - MISSING_ACTIVATION → fixable: false
 - MISSING_ALT_FRAGMENT → fixable: false
+- SPELLING_MISTAKE → fixable: true, action: rename_shape, name: <correct spelling from scenario>
 
 ## RESPONSE FORMAT (JSON only, no markdown)
 {{
@@ -1303,6 +1279,7 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 ### MISSING_LIFELINE:
 - STRICT: Only report for participants EXPLICITLY named in the scenario.
 - STRICT: An `object` shape with a name counts as a valid lifeline — do NOT report it missing.
+- STRICT: If a lifeline/object name in the diagram is a close misspelling of a scenario participant → report SPELLING_MISTAKE ONLY, NOT MISSING_LIFELINE.
 
 ### MISSING_MESSAGE:
 - STRICT: Only for interactions EXPLICITLY described in the scenario.
@@ -1333,7 +1310,6 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 ### General:
 - STRICT: When in doubt about ANY error, SKIP it.
 - STRICT: Use semantic understanding — diagrams correct in logic are correct.
-- STRICT: If you report a SPELLING_MISTAKE_LIFELINE for an element, do NOT also report MISSING_LIFELINE, EXTRA_LIFELINE, or ISOLATED_LIFELINE for that same element. ONE error only — the spelling mistake.
 """
 
 
@@ -1565,6 +1541,7 @@ def _build_image_prompt(diagram_type: str, scenario: str) -> str:
 10. MISSING_VERB_IN_USE_CASE — Use case name missing action verb.
 11. DUPLICATE_ACTOR — Same actor name appears twice.
 12. DUPLICATE_USE_CASE — Same use case name appears twice.
+13. SPELLING_MISTAKE   — An actor or use case name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_ACTOR/MISSING_USE_CASE or EXTRA_ACTOR/EXTRA_USE_CASE for the same element.
 CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisation as missing/extra."""
         dtype_label = "USE CASE"
         extra_rules = """
@@ -1587,7 +1564,8 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 6. UNLABELLED_LIFELINE — Lifeline box has no label.
 7. UNLABELLED_OBJECT — Object box has no label (say "object" not "lifeline").
 8. MISSING_DELETION_SYMBOL — Lifeline has no X/destroy marker. Only report if X symbols are genuinely absent.
-9. UNLABELLED_ARROW — Message arrow has no label."""
+9. UNLABELLED_ARROW — Message arrow has no label.
+10. SPELLING_MISTAKE — A lifeline/object/actor name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_LIFELINE or EXTRA_LIFELINE for the same element."""
         dtype_label = "SEQUENCE"
         extra_rules = """
 ## SELF-MESSAGE RULE:
@@ -1613,7 +1591,8 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 6. MISSING_MULTIPLICITY — Association arrow drawn but multiplicity labels are absent.
 7. WRONG_MULTIPLICITY — Multiplicity present but value differs from scenario.
 8. MISSING_ASSOCIATION_LABEL — Scenario names a label for a relationship but it's not on the arrow.
-9. EMPTY_CLASS_NAME — Class has no name or placeholder like "Class 1"."""
+9. EMPTY_CLASS_NAME — Class has no name or placeholder like "Class 1".
+10. SPELLING_MISTAKE — A class name closely resembles a scenario class name but is misspelled (e.g. "Custmer" vs "Customer"). ONE error only — do NOT also report MISSING_CLASS or EXTRA_CLASS for the same element."""
         dtype_label = "CLASS"
         extra_rules = """
 ## CLASS CAPITALISATION RULE:
@@ -1630,7 +1609,7 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 - If scenario does not name the relationship → labels are optional."""
 
     return f"""You are an expert UML {dtype_label} Diagram validator using SEMANTIC analysis. You are given an IMAGE of the diagram.
-{_RULES_VERSION_BLOCK}
+
 ## CRITICAL INSTRUCTION
 Look carefully at the ACTUAL IMAGE provided. Validate ONLY what you can SEE.
 - Only report something as MISSING if it is genuinely absent from the image.
@@ -1663,6 +1642,7 @@ For each error, provide an "auto_fix" object. Set "fixable": true only for these
 - MISSING_DELETION_SYMBOL → action: "add_shape", shape_type: "deletion_marker", name: <lifeline name>
 - EMPTY_CLASS_NAME / UNLABELLED_LIFELINE / UNLABELLED_OBJECT → action: "rename_shape", name
 - DUPLICATE_* → action: "merge_shapes", name
+- SPELLING_MISTAKE → action: "rename_shape", name: <correct spelling from scenario>, fixable: true
 - DISCONNECTED_ACTOR / ISOLATED_USE_CASE → action: "add_arrow", from_element, to_element, arrow_type: "association"
 - MISSING_MULTIPLICITY → action: "add_label", from_element, to_element, multiplicity_from, multiplicity_to
 All other errors → fixable: false
@@ -1699,8 +1679,7 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: Do NOT report MISSING_ATTRIBUTE or MISSING_METHOD unless scenario explicitly requires them.
 - STRICT: Do NOT invent sub-use-cases, intermediate messages, or implied relationships not in scenario.
 - STRICT: Only report what you can clearly SEE is wrong — when in doubt, SKIP the error.
-- STRICT: Use semantic matching — equivalent labels count as correct.
-- STRICT: If you report a SPELLING_MISTAKE_* error for an element, do NOT also report MISSING_*, EXTRA_*, or any other error for that same element. ONE error only — the spelling mistake."""
+- STRICT: Use semantic matching — equivalent labels count as correct."""
 
 
 def _call_model_with_image(prompt: str, image_b64: str, mime_type: str, api_key: str, model: str) -> Optional[Dict]:
@@ -1839,6 +1818,26 @@ def validate_with_openai_image(
                 else:                 errors.append(item)
 
             all_items = errors + warnings + info
+
+            # Spelling mistake dedup: suppress MISSING_*/EXTRA_* for elements already flagged as SPELLING_MISTAKE
+            _img_spelled = set()
+            for _i in all_items:
+                if _n(str(_i.get("error_type", ""))) == "spelling_mistake":
+                    _img_spelled.add(_n(str(_i.get("element", ""))))
+            if _img_spelled:
+                def _img_keep(i):
+                    et   = _n(str(i.get("error_type", "")))
+                    elem = _n(str(i.get("element", "")))
+                    if et == "spelling_mistake":
+                        return True
+                    if elem in _img_spelled and ("missing" in et or "extra" in et):
+                        return False
+                    return True
+                errors   = [i for i in errors   if _img_keep(i)]
+                warnings = [i for i in warnings if _img_keep(i)]
+                info     = [i for i in info     if _img_keep(i)]
+                all_items = errors + warnings + info
+
             fixable_count = sum(1 for i in all_items if i.get("auto_fix", {}).get("fixable"))
 
             return {
