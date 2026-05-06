@@ -43,6 +43,24 @@ _SYSTEM_MESSAGE = (
     "Return valid JSON only — no markdown, no prose."
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# IMMUTABLE VALIDATION RULES VERSION
+# This constant locks the validation logic. Every prompt includes this hash so
+# the LLM always applies the EXACT same rule set across all validations and
+# re-validation/debug cycles. Never change this value — bump only if rules
+# intentionally change (and update all prompts accordingly).
+# ─────────────────────────────────────────────────────────────────────────────
+_RULES_VERSION = "UML-VALIDATOR-RULES-v1.0-FROZEN"
+
+_RULES_VERSION_BLOCK = (
+    f"\n## VALIDATION RULES VERSION: {_RULES_VERSION}\n"
+    "CRITICAL: These rules are FIXED and IMMUTABLE. Apply EXACTLY these rules every time — "
+    "on first validation, re-validation, and every debug cycle. "
+    "Do NOT add, remove, or modify any rule between runs. "
+    "Do NOT introduce new error types not listed below. "
+    "The rule set below is the COMPLETE and FINAL list — nothing else is valid.\n"
+)
+
 
 def _get_api_key() -> Optional[str]:
     key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -696,6 +714,44 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
 
     rule_errors_filtered = [r for r in rule_errors if keep_rule(r)]
 
+    # ── SPELLING MISTAKE DEDUPLICATION ────────────────────────────────────────
+    # If a SPELLING_MISTAKE_* error exists for an element, suppress all other
+    # errors (MISSING_*, EXTRA_*, etc.) for that same element so only ONE error
+    # is shown: the spelling mistake.  This applies across rule + LLM errors.
+    def _collect_spelling_elements(error_list):
+        """Return set of normalized element names that have a spelling mistake error."""
+        misspelled = set()
+        for e in error_list:
+            if str(e.get("error_type", "")).upper().startswith("SPELLING_MISTAKE"):
+                el = _n(str(e.get("element", "")))
+                if el:
+                    misspelled.add(el)
+                # Also capture the 'wrong' name from auto_fix if present
+                fix = e.get("auto_fix") or {}
+                name = _n(str(fix.get("name", "")))
+                if name:
+                    misspelled.add(name)
+        return misspelled
+
+    all_combined = rule_errors_filtered + filtered_errors + filtered_warnings + filtered_info
+    spelling_elements = _collect_spelling_elements(all_combined)
+
+    def _suppress_if_spelling(e):
+        """Return False (drop) if this error is about an element already covered by SPELLING_MISTAKE."""
+        et = str(e.get("error_type", "")).upper()
+        if et.startswith("SPELLING_MISTAKE"):
+            return True  # always keep the spelling mistake itself
+        el = _n(str(e.get("element", "")))
+        if el and el in spelling_elements:
+            return False  # suppress — spelling mistake covers this element
+        return True
+
+    rule_errors_filtered  = [r for r in rule_errors_filtered  if _suppress_if_spelling(r)]
+    filtered_errors       = [e for e in filtered_errors        if _suppress_if_spelling(e)]
+    filtered_warnings     = [e for e in filtered_warnings      if _suppress_if_spelling(e)]
+    filtered_info         = [e for e in filtered_info          if _suppress_if_spelling(e)]
+    # ─────────────────────────────────────────────────────────────────────────
+
     def to_item(r):
         return {
             "error_type":  r["error_type"],
@@ -745,7 +801,7 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
 
 def _prompt_class(scenario: str, shapes: List[Dict]) -> str:
     return f"""You are an expert UML Class Diagram validator using SEMANTIC analysis.
-
+{_RULES_VERSION_BLOCK}
 ## TASK
 This is a CLASS DIAGRAM. Validate it using ONLY class diagram rules. Return ONLY valid JSON.
 
@@ -937,12 +993,13 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 ### General:
 - STRICT: When in doubt about ANY error, SKIP it.
 - STRICT: Use semantic understanding — a diagram correct in logic is correct even if wording differs.
+- STRICT: If you report a SPELLING_MISTAKE_CLASS for an element, do NOT also report MISSING_CLASS or EXTRA_CLASS for the same element. ONE error only — the spelling mistake.
 """
 
 
 def _prompt_usecase(scenario: str, shapes: List[Dict]) -> str:
     return f"""You are an expert UML Use Case Diagram validator.
-
+{_RULES_VERSION_BLOCK}
 ## TASK
 This is a USE CASE DIAGRAM. Validate it using ONLY use case diagram rules. Return ONLY valid JSON.
 
@@ -1083,12 +1140,13 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: When in doubt about ANY error, SKIP it — do not report it.
 - STRICT: Do NOT assume actors or use cases that are implied but not written in scenario.
 - STRICT: Results must be DETERMINISTIC — same diagram + scenario must always produce the same errors.
+- STRICT: If you report a SPELLING_MISTAKE_ACTOR or SPELLING_MISTAKE_USE_CASE for an element, do NOT also report MISSING_ACTOR, EXTRA_ACTOR, MISSING_USE_CASE, or EXTRA_USE_CASE for that same element. ONE error only — the spelling mistake.
 """
 
 
 def _prompt_sequence(scenario: str, shapes: List[Dict]) -> str:
     return f"""You are an expert UML Sequence Diagram validator using SEMANTIC analysis.
-
+{_RULES_VERSION_BLOCK}
 ## TASK
 This is a SEQUENCE DIAGRAM. Validate it using ONLY sequence diagram rules. Return ONLY valid JSON.
 
@@ -1275,6 +1333,7 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 ### General:
 - STRICT: When in doubt about ANY error, SKIP it.
 - STRICT: Use semantic understanding — diagrams correct in logic are correct.
+- STRICT: If you report a SPELLING_MISTAKE_LIFELINE for an element, do NOT also report MISSING_LIFELINE, EXTRA_LIFELINE, or ISOLATED_LIFELINE for that same element. ONE error only — the spelling mistake.
 """
 
 
@@ -1571,7 +1630,7 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 - If scenario does not name the relationship → labels are optional."""
 
     return f"""You are an expert UML {dtype_label} Diagram validator using SEMANTIC analysis. You are given an IMAGE of the diagram.
-
+{_RULES_VERSION_BLOCK}
 ## CRITICAL INSTRUCTION
 Look carefully at the ACTUAL IMAGE provided. Validate ONLY what you can SEE.
 - Only report something as MISSING if it is genuinely absent from the image.
@@ -1640,7 +1699,8 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: Do NOT report MISSING_ATTRIBUTE or MISSING_METHOD unless scenario explicitly requires them.
 - STRICT: Do NOT invent sub-use-cases, intermediate messages, or implied relationships not in scenario.
 - STRICT: Only report what you can clearly SEE is wrong — when in doubt, SKIP the error.
-- STRICT: Use semantic matching — equivalent labels count as correct."""
+- STRICT: Use semantic matching — equivalent labels count as correct.
+- STRICT: If you report a SPELLING_MISTAKE_* error for an element, do NOT also report MISSING_*, EXTRA_*, or any other error for that same element. ONE error only — the spelling mistake."""
 
 
 def _call_model_with_image(prompt: str, image_b64: str, mime_type: str, api_key: str, model: str) -> Optional[Dict]:
