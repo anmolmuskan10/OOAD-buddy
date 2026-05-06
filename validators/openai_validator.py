@@ -410,44 +410,57 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
             else:
                 use_cases[n] = name
 
-    # Build connection map from arrow shapes
-    conn = _build_connection_map(shapes)
+                # Check: use case name should start with a verb (action word)
+                # Common UML verbs list
+                _COMMON_VERBS = {
+                    "add","apply","approve","authenticate","authorize","browse","buy",
+                    "calculate","cancel","change","check","close","complete","confirm",
+                    "create","delete","display","download","edit","enter","export",
+                    "filter","generate","get","handle","import","initiate","insert",
+                    "launch","list","log","login","logout","manage","modify","monitor",
+                    "notify","open","pay","perform","place","print","process","provide",
+                    "purchase","read","receive","register","remove","request","reset",
+                    "retrieve","review","save","search","select","send","set","show",
+                    "sign","start","submit","track","update","upload","validate","verify",
+                    "view","withdraw","write",
+                }
+                first_word = name.strip().split()[0].lower() if name.strip() else ""
+                if first_word and first_word not in _COMMON_VERBS:
+                    errors.append({
+                        "error_type": "MISSING_VERB_IN_USE_CASE", "severity": "WARNING",
+                        "element": name,
+                        "description": f"Use case '{name}' does not start with an action verb.",
+                        "suggestion": f"Rename '{name}' to start with a verb, e.g. 'Manage {name}' or 'Process {name}'.",
+                        "auto_fix": {"fixable": True, "action": "rename_shape", "name": f"Manage {name}"},
+                    })
 
-    # Check: every actor must connect to at least one use case
+    # NOTE: Connection checking (DISCONNECTED_ACTOR / ISOLATED_USE_CASE) is intentionally
+    # NOT done here. Flutter arrows use spatial positioning — their from/to fields are empty,
+    # so _build_connection_map() would always return an empty map and produce false positives.
+    # Spatial connection checking is handled correctly by usecase_validator.py (_line_touches()).
+
+    # Check: actor names should be nouns (not start with a verb)
+    _COMMON_VERBS_ACTOR = {
+        "add","apply","approve","authenticate","authorize","browse","buy",
+        "calculate","cancel","change","check","close","complete","confirm",
+        "create","delete","display","download","edit","enter","export",
+        "filter","generate","get","handle","import","initiate","insert",
+        "launch","list","log","login","logout","manage","modify","monitor",
+        "notify","open","pay","perform","place","print","process","provide",
+        "purchase","read","receive","register","remove","request","reset",
+        "retrieve","review","save","search","select","send","set","show",
+        "sign","start","submit","track","update","upload","validate","verify",
+        "view","withdraw","write",
+    }
     for n, orig in actors.items():
-        actor_conns = conn.get(n, set())
-        # Check if any connection target is a use case
-        connected_to_uc = any(target in use_cases for target in actor_conns)
-        if not connected_to_uc:
+        first_word = orig.strip().split()[0].lower() if orig.strip() else ""
+        if first_word and first_word in _COMMON_VERBS_ACTOR:
             errors.append({
-                "error_type": "DISCONNECTED_ACTOR", "severity": "ERROR",
+                "error_type": "ACTOR_SHOULD_BE_NOUN", "severity": "WARNING",
                 "element": orig,
-                "description": f"Actor '{orig}' is not connected to any use case.",
-                "suggestion": f"Draw an association line from '{orig}' to at least one use case.",
-                "auto_fix": {
-                    "fixable": True, "action": "add_arrow",
-                    "from_element": orig,
-                    "to_element": next((use_cases[k] for k in use_cases), ""),
-                    "arrow_type": "association",
-                },
-            })
-
-    # Check: every use case must connect to at least one actor
-    for n, orig in use_cases.items():
-        uc_conns = conn.get(n, set())
-        connected_to_actor = any(target in actors for target in uc_conns)
-        if not connected_to_actor:
-            errors.append({
-                "error_type": "ISOLATED_USE_CASE", "severity": "ERROR",
-                "element": orig,
-                "description": f"Use case '{orig}' is not connected to any actor.",
-                "suggestion": f"Connect '{orig}' to at least one actor.",
-                "auto_fix": {
-                    "fixable": True, "action": "add_arrow",
-                    "from_element": next((actors[k] for k in actors), ""),
-                    "to_element": orig,
-                    "arrow_type": "association",
-                },
+                "description": f"Actor '{orig}' appears to start with a verb. Actors should represent roles or entities (nouns), not actions.",
+                "suggestion": f"Rename '{orig}' to a role or entity name, e.g. 'Customer', 'Admin', or 'System'.",
+                "auto_fix": {"fixable": False},
             })
 
     return errors
