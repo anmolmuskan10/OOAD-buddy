@@ -3,3 +3,4 @@ flask-cors==4.0.1
 spacy==3.7.5
 gunicorn==21.2.0
 python-dotenv==1.0.1
+sentence-transformers==2.7.0
