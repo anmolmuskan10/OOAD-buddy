@@ -344,11 +344,13 @@ Examples of semantically equivalent descriptions:
 - A diagram with classes but NO relationships drawn is valid if the scenario does not describe relationships.
 
 ## CLASS NAME CASE RULES — CRITICAL:
-- If a class name exists in the diagram but with wrong capitalisation (e.g. "customer" instead of "Customer"):
-  → Report WRONG_CLASS_CAPITALISATION with suggestion to "Capitalise the first letter: rename 'customer' to 'Customer'."
+- Class name matching is CASE-INSENSITIVE. "customer" and "Customer" are the SAME class.
+- NEVER report MISSING_CLASS or EXTRA_CLASS just because of capitalisation differences.
+- If a class name exists with wrong capitalisation (e.g. "customer" vs "Customer"):
+  → You MAY report WRONG_CLASS_CAPITALISATION as WARNING severity only — it is cosmetic, not a structural error.
+  → Suggestion: "Capitalise the first letter: rename 'customer' to 'Customer'."
   → Do NOT report it as EXTRA_CLASS or say to remove it.
-  → Do NOT report it as MISSING_CLASS for the correctly-capitalised version.
-- Class names MUST start with an uppercase letter in UML. Lowercase first letter = capitalisation error only.
+  → Do NOT also report MISSING_CLASS for the capitalised version — they are the same class.
 
 ## MISSING LABEL RULES:
 - If a relationship arrow exists between ClassA and ClassB, and the scenario explicitly names a label for that relationship (e.g. "manages", "contains", "employs"), but the drawn arrow has no label → report MISSING_ASSOCIATION_LABEL.
@@ -427,6 +429,9 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 ## STRICT RULES — MUST FOLLOW:
 - Results must be DETERMINISTIC — same diagram + scenario must always give same errors.
 - Only report issues you are CONFIDENT about. Do NOT invent errors.
+- NEVER flag capitalisation/case differences as structural errors (MISSING_CLASS, EXTRA_CLASS). Use WRONG_CLASS_CAPITALISATION (WARNING) at most.
+- Before including any error, ask yourself: "Am I 100% certain this is wrong?" — if not, SKIP it.
+- Before returning your response, re-read the shapes list and verify each reported error actually exists.
 
 ### MISSING_CLASS:
 - STRICT: Only report for nouns EXPLICITLY written as class names in the scenario.
@@ -561,6 +566,9 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 
 ## STRICT VALIDATION RULES — MUST FOLLOW:
 - Only report issues you are CONFIDENT about. Do NOT invent errors.
+- Case/capitalisation differences are NEVER structural errors. Actor/use-case matching is CASE-INSENSITIVE.
+- Before including any error, ask yourself: "Am I 100% certain this is wrong?" — if not, SKIP it.
+- Before returning your response, verify each error against the shapes list.
 
 ### MISSING_ACTOR hallucination prevention:
 - STRICT: Only report MISSING_ACTOR for persons/systems that are EXPLICITLY written in the scenario.
@@ -739,6 +747,9 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 ## STRICT RULES — MUST FOLLOW:
 - Results must be DETERMINISTIC — same diagram + scenario must always give the same errors.
 - Only report issues you are CONFIDENT about. Do NOT invent errors.
+- Case/capitalisation differences are NEVER structural errors. Lifeline/message matching is CASE-INSENSITIVE.
+- Before including any error, ask yourself: "Am I 100% certain this is wrong?" — if not, SKIP it.
+- Before returning your response, verify each error against the shapes list.
 
 ### MISSING_LIFELINE:
 - STRICT: Only report for participants EXPLICITLY named in the scenario.
@@ -792,12 +803,25 @@ def _build_prompt(diagram_type: str, scenario: str, shapes: List[Dict]) -> str:
 # HTTP call
 # ─────────────────────────────────────────────────────────────────────────────
 
+_SYSTEM_MESSAGE = (
+    "You are a strict, deterministic UML diagram validator. "
+    "You ONLY report errors you are 100% certain about based on the provided shapes and scenario. "
+    "You NEVER invent errors, never flag capitalisation differences as structural errors, "
+    "and you ALWAYS return valid JSON with no markdown. "
+    "Same input must always produce the same output."
+)
+
+
 def _call_model(prompt: str, api_key: str, model: str) -> Optional[Dict]:
     url = f"{_OPENAI_API_BASE}/chat/completions"
     payload = json.dumps({
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,   # deterministic — prevents errors changing on re-validation
+        "messages": [
+            {"role": "system", "content": _SYSTEM_MESSAGE},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0,    # deterministic — prevents errors changing on re-validation
+        "seed": 42,          # OpenAI seed for extra determinism
         "max_tokens": 8192,
     }).encode("utf-8")
 
@@ -969,7 +993,7 @@ def _build_image_prompt(diagram_type: str, scenario: str) -> str:
 10. MISSING_VERB_IN_USE_CASE — Use case name missing action verb.
 11. DUPLICATE_ACTOR — Same actor name appears twice.
 12. DUPLICATE_USE_CASE — Same use case name appears twice.
-CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisation as missing/extra."""
+CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisation as missing/extra. Capitalisation differences are NEVER structural errors."""
         dtype_label = "USE CASE"
         extra_rules = """
 ## ACTOR CONNECTION RULE:
@@ -1040,6 +1064,9 @@ Look carefully at the ACTUAL IMAGE provided. Validate ONLY what you can SEE.
 - Only report something as MISSING if it is genuinely absent from the image.
 - Do NOT invent errors for things that are present but styled differently than expected.
 - Results must be DETERMINISTIC — same image + scenario must always produce the same errors.
+- NEVER report capitalisation/case differences as structural errors (missing/extra elements).
+- Before each error you include, ask: "Am I 100% certain this is wrong?" — if not, SKIP it.
+- Before returning your final JSON, re-examine the image and verify each reported error is truly visible.
 
 ## SCENARIO
 {scenario}
@@ -1111,14 +1138,18 @@ def _call_model_with_image(prompt: str, image_b64: str, mime_type: str, api_key:
     url = f"{_OPENAI_API_BASE}/chat/completions"
     payload = json.dumps({
         "model": model,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
-            ],
-        }],
-        "temperature": 0,   # deterministic — prevents errors changing on re-validation
+        "messages": [
+            {"role": "system", "content": _SYSTEM_MESSAGE},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
+                ],
+            },
+        ],
+        "temperature": 0,    # deterministic — prevents errors changing on re-validation
+        "seed": 42,          # OpenAI seed for extra determinism
         "max_tokens": 8192,
     }).encode("utf-8")
 
