@@ -9,10 +9,13 @@ OpenAI AI Validator for ALL diagram types:
 Model: gpt-4o
 Rate limit (429): auto wait + retry
 
-IMPROVED: Better prompts for all 3 diagram types.
-  - Scenario se entities/actors/classes extract karo
-  - Har cheez check karo jo scenario mein hai
-  - False positives avoid karo
+FIXES APPLIED:
+  1. WRONG_RELATIONSHIP: arrow type mismatch properly detected & reported
+  2. WRONG_MULTIPLICITY / WRONG_LABEL: incorrect multiplicity/label reported
+  3. WRONG_ASSOCIATION_LABEL: wrong label on association arrow reported
+  4. Attributes/methods from scenario → do NOT suggest creating a new class
+  5. Errors/suggestions are concise and to-the-point (max 1 sentence each)
+  6. Image-based validation: real class/relation/boundary detection fixed
 """
 
 import os
@@ -52,6 +55,7 @@ _TOOLTYPE_MAP = {
     "aggregation":          "aggregation_arrow",
     "composition":          "composition_arrow",
     "dependency":           "dependency_arrow",
+    "openarrow":            "association_arrow",    # openArrow = plain association
     "dashedarrow":          "dashed_arrow",
     "dashedopenarow":       "dashed_open_arrow",
     "dottedarrow":          "dotted_arrow",
@@ -121,7 +125,9 @@ def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
 
         entry: Dict[str, Any] = {"type": clean_t}
         for field in ("text", "label", "name", "id", "from", "to",
-                      "startLifeline", "endLifeline", "lifelineRef"):
+                      "startLifeline", "endLifeline", "lifelineRef",
+                      "arrow_type", "multiplicity_start", "multiplicity_end",
+                      "relationship_label", "message_label"):
             val = s.get(field)
             if val is not None and str(val).strip().lower() not in ("", "none", "null", "undefined"):
                 if field == "text" and "\n" in str(val):
@@ -166,12 +172,19 @@ def _build_fallback_fix(error_type: str, element: str, raw_error: dict, diagram_
         if from_el and to_el:
             return {"fixable": True, "action": "change_arrow_type",
                     "from_element": from_el, "to_element": to_el, "arrow_type": arrow}
-    if "MISSING_MULTIPLICITY" in et:
+        return {"fixable": False}
+    if "WRONG_MULTIPLICITY" in et or "MISSING_MULTIPLICITY" in et:
         from_el, to_el = _parse_from_to(desc + " " + suggestion.lower())
         if from_el and to_el:
             return {"fixable": True, "action": "add_label",
                     "from_element": from_el, "to_element": to_el,
                     "multiplicity_from": "1", "multiplicity_to": "*"}
+        return {"fixable": False}
+    if "WRONG_LABEL" in et or "WRONG_ASSOCIATION_LABEL" in et:
+        from_el, to_el = _parse_from_to(desc + " " + suggestion.lower())
+        if from_el and to_el:
+            return {"fixable": True, "action": "add_label",
+                    "from_element": from_el, "to_element": to_el}
         return {"fixable": False}
 
     if "MISSING_ACTOR" in et:
@@ -237,107 +250,97 @@ def _guess_arrow_type(text: str, diagram_type: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# IMPROVED PROMPT BUILDERS
+# PROMPT BUILDERS (text-based)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _prompt_class(scenario: str, shapes: List[Dict]) -> str:
-    return f"""You are a strict UML Class Diagram validator. Your job is to find ALL real errors.
-
-## YOUR TASK
-1. Read the SCENARIO carefully — identify every important NOUN (these should be classes).
-2. Read the DIAGRAM SHAPES — these are what the student actually drew.
-3. Compare them: report every mismatch, missing element, and wrong relationship.
+    return f"""You are a strict UML Class Diagram validator. Find ALL real errors.
 
 ## SCENARIO
 {scenario}
 
-## DIAGRAM SHAPES (what student drew)
+## DIAGRAM SHAPES (JSON from student's drawing tool)
 {json.dumps(shapes, indent=2)}
 
 ## HOW TO READ SHAPE DATA
-Each shape has these important fields:
-- "type": shape type (ToolType.classFullShape = class box, ToolType.association = association arrow, etc.)
-- "text": for class boxes = class name; for arrows = raw "startMult|label|endMult" string
-- "arrow_type": READABLE arrow type — "association", "aggregation", "composition", "generalization", "dependency"
-- "multiplicity_start": multiplicity at the FROM end (e.g. "1", "0..1")
-- "multiplicity_end": multiplicity at the TO end (e.g. "*", "1..*")
-- "relationship_label": label on the arrow (e.g. "manages", "contains")
+- "type": "class" = class box; "association_arrow"/"aggregation_arrow"/"composition_arrow"/"generalization_arrow"/"dependency_arrow" = relationship arrows
+- "text": for class boxes = full text content (first line = class name; subsequent lines = attributes/methods). NEVER treat attributes or methods as class names.
+- "arrow_type": the actual drawn arrow type (e.g. "association", "composition", "generalization")
+- "multiplicity_start": multiplicity at the FROM end (e.g. "1", "0..1"). MISSING field = no multiplicity drawn.
+- "multiplicity_end": multiplicity at the TO end (e.g. "*", "1..*"). MISSING field = no multiplicity drawn.
+- "relationship_label": label on the relationship arrow (e.g. "manages", "teaches")
 - "from" / "to": which class the arrow connects
 
-IMPORTANT FOR MULTIPLICITY CHECK:
-- If an association/aggregation/composition arrow does NOT have "multiplicity_start" field → start end is MISSING multiplicity
-- If an association/aggregation/composition arrow does NOT have "multiplicity_end" field → end end is MISSING multiplicity
-- Both ends MUST have multiplicity → report MISSING_MULTIPLICITY if either is absent
+## CRITICAL — BEFORE REPORTING ANY ERROR:
+1. Extract from "text" of class shapes: line 0 = class name, remaining lines = attributes/methods.
+2. If a word appears as an attribute or method inside a class box → it is NOT a missing class.
+3. Only report MISSING_CLASS if the entity has NO class box at all.
+4. Attributes/methods listed in scenario belong INSIDE a class box — do NOT report them as missing classes.
 
-## RULES TO CHECK
+## RULES
 
 ### R1 — MISSING_CLASS (ERROR)
-Every important noun/entity in the scenario MUST appear as a class shape.
-- Extract all key nouns from the scenario.
-- For each noun: if no class shape has a matching name → MISSING_CLASS error.
-- Match names case-insensitively and allow minor spelling variations.
+Every important entity/noun in the scenario needs a class box.
+- Check each entity: does a class shape have it as the CLASS NAME (first line of text)?
+- If an entity only appears as an attribute inside another class → it is NOT a missing class.
 
 ### R2 — EXTRA_CLASS (WARNING)
-A class exists in diagram but is NOT mentioned anywhere in the scenario.
-- Only report if the class name has NO relation to any scenario concept.
+A class exists that is not mentioned anywhere in the scenario.
 
 ### R3 — MISSING_RELATIONSHIP (ERROR)
-If scenario explicitly states a relationship between two entities, it must be drawn.
-- "has", "contains", "owns", "manages", "consists of" → association or composition
-- "is a", "extends", "inherits" → generalization arrow
-- "uses", "depends on" → dependency
-- For each stated relationship: if no arrow exists between those classes → error.
+A relationship stated in the scenario has no arrow drawn between the two classes.
 
-### R4 — WRONG_RELATIONSHIP (ERROR)
-An arrow exists but the relationship TYPE is wrong vs what scenario implies.
-- "consists of" / "part of" / "owns" → should be composition, not association
-- "has many" / "collection of" → should be aggregation
-- "is a" / "type of" → should be generalization, not association
+### R4 — WRONG_RELATIONSHIP (ERROR) ← IMPORTANT
+The arrow DRAWN between two classes uses the WRONG type vs what the scenario implies.
+- Check: arrow's "arrow_type" field vs what the scenario says.
+- "consists of" / "part of" / "owns" → must be "composition", not "association"
+- "has many" / "collection of" → must be "aggregation", not "association"
+- "is a" / "extends" / "type of" → must be "generalization", not "association"
+- "uses" / "depends on" → must be "dependency"
+- Report: WRONG_RELATIONSHIP with element = "ClassA → ClassB", description = "Used [drawn_type] but scenario implies [correct_type]."
 
-### R5 — MISSING_MULTIPLICITY (WARNING)
-Every association arrow MUST have multiplicity labels on BOTH ends (e.g. 1, *, 1..*, 0..1).
-- Check every arrow of type: association_arrow, aggregation_arrow, composition_arrow.
-- If EITHER end is missing a multiplicity label → MISSING_MULTIPLICITY warning.
+### R5 — WRONG_MULTIPLICITY (WARNING) ← IMPORTANT
+An arrow exists and has multiplicity fields, but the VALUES are incorrect for the scenario.
+- e.g. Scenario says "one customer places many orders" → must be 1 on Customer end, * on Order end.
+- If drawn multiplicity doesn't match → report WRONG_MULTIPLICITY.
+- Also report MISSING_MULTIPLICITY if either "multiplicity_start" or "multiplicity_end" field is absent.
 
-### R6 — WRONG_INHERITANCE (ERROR)
-Generalization arrow must point FROM child TO parent.
-- If arrow goes from parent to child → WRONG_INHERITANCE error.
+### R6 — WRONG_ASSOCIATION_LABEL (WARNING) ← IMPORTANT
+An association arrow has a "relationship_label" that does not match what the scenario describes.
+- e.g. Scenario says "Teacher teaches Student" but label is "manages" → WRONG_ASSOCIATION_LABEL.
+- Also report MISSING_ASSOCIATION_LABEL if scenario mentions a label but none is drawn.
 
-### R7 — DUPLICATE_CLASS (ERROR)
-Same class name appears more than once in shapes.
+### R7 — WRONG_INHERITANCE (ERROR)
+Generalization arrow must go FROM child TO parent. If reversed → error.
 
-### R8 — EMPTY_CLASS_NAME (ERROR)
-A class shape has no name, empty name, or placeholder like "Class1", "NewClass".
+### R8 — DUPLICATE_CLASS (ERROR)
+Same class name appears more than once.
 
-### R9 — CIRCULAR_INHERITANCE (ERROR)
-Class A inherits from B AND B inherits from A → circular.
+### R9 — EMPTY_CLASS_NAME (ERROR)
+A class box has no name, empty name, or placeholder like "Class1".
 
 ### R10 — MISSING_ATTRIBUTE (WARNING)
-ONLY report if scenario EXPLICITLY mentions a specific attribute for a class.
-Example: "Each Student has a studentId and name" → Student must have studentId, name.
-Do NOT assume standard attributes. Do NOT report if scenario doesn't specify.
+ONLY if scenario EXPLICITLY names a specific attribute for a class (e.g. "Student has studentId and name").
+Do NOT invent attributes. Do NOT report if scenario doesn't specify.
 
 ### R11 — MISSING_METHOD (WARNING)
-ONLY report if scenario EXPLICITLY mentions a specific operation/method for a class.
-Example: "Student can login() and logout()" → Student must have login(), logout().
-Do NOT assume methods. Do NOT report if scenario doesn't specify.
+ONLY if scenario EXPLICITLY names a specific method (e.g. "Student can login()").
+Do NOT invent methods.
 
-## CRITICAL RULES TO AVOID FALSE POSITIVES
-- A class box has 3 sections: TOP = class name, MIDDLE = attributes, BOTTOM = methods.
-- NEVER treat attribute names (camelCase like studentId, orderId) as class names.
-- NEVER treat method names (ending with ()) as class names.
-- NEVER report SPELLING_MISTAKE if the "corrected" name is actually an attribute visible inside the box.
-- Only report an error when you are CERTAIN it is a real mistake.
+## CONCISENESS RULE
+- "description": max 1 sentence, state exactly what is wrong.
+- "suggestion": max 1 sentence, state exactly how to fix it.
+- Do NOT write paragraphs. Be direct and specific.
 
-## RESPONSE FORMAT (JSON only, no markdown fences)
+## RESPONSE FORMAT (pure JSON, no markdown, no extra text)
 {{
   "errors": [
     {{
       "error_type": "RULE_CODE",
       "severity": "ERROR|WARNING|INFO",
-      "element": "affected element name",
-      "description": "Clear explanation of what is wrong",
-      "suggestion": "Exactly how to fix it",
+      "element": "affected element (e.g. 'Student', 'Student → Order')",
+      "description": "One sentence: what is wrong.",
+      "suggestion": "One sentence: how to fix it.",
       "auto_fix": {{
         "fixable": true,
         "action": "add_shape|delete_shape|rename_shape|add_arrow|delete_arrow|change_arrow_type|add_label|merge_shapes",
@@ -352,104 +355,75 @@ Do NOT assume methods. Do NOT report if scenario doesn't specify.
     }}
   ],
   "score": 0-100,
-  "summary": "X errors, Y warnings found"
+  "summary": "X errors, Y warnings."
 }}
 
-If diagram is fully correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
+If fully correct: {{"errors": [], "score": 100, "summary": "Diagram is correct."}}
 """
 
 
 def _prompt_usecase(scenario: str, shapes: List[Dict]) -> str:
-    return f"""You are a strict UML Use Case Diagram validator. Your job is to find ALL real errors.
-
-## YOUR TASK
-1. Read the SCENARIO carefully.
-   - Identify every PERSON or EXTERNAL SYSTEM mentioned → these are ACTORS (stick figures).
-   - Identify every ACTION, FUNCTION, or FEATURE mentioned → these are USE CASES (ovals).
-2. Read the DIAGRAM SHAPES — these are what the student actually drew.
-3. Compare them: report every mismatch, missing element, and wrong connection.
+    return f"""You are a strict UML Use Case Diagram validator. Find ALL real errors.
 
 ## SCENARIO
 {scenario}
 
-## DIAGRAM SHAPES (what student drew)
+## DIAGRAM SHAPES
 {json.dumps(shapes, indent=2)}
 
 ## HOW TO READ SHAPE DATA
-- "type": ToolType.actor = stick figure actor, ToolType.useCase = oval, ToolType.systemBoundary = boundary box
-- "text": name of the actor/use case
-- "arrow_type": "association" = actor-usecase line, "include_extend" = include/extend arrow, "generalization" = inheritance
-- "from" / "to": which shapes the arrow connects
+- "type": "actor" = stick figure, "use_case_oval" = oval, "system_boundary" = boundary box
+- "text": name of the actor or use case
+- "arrow_type": "association" / "include_extend" / "generalization"
+- "from" / "to": connected shapes
 
-## RULES TO CHECK
+## RULES
 
 ### R1 — MISSING_ACTOR (ERROR)
-Every person or external system in the scenario MUST appear as an actor shape.
-- List all people/systems from scenario. Check each one in shapes.
-- If an actor from scenario is not drawn → MISSING_ACTOR error.
+Every person/external system in the scenario needs an actor shape.
 
 ### R2 — EXTRA_ACTOR (WARNING)
-An actor exists in diagram but is not mentioned in scenario.
-- Only report if clearly not related to any scenario concept.
+Actor in diagram not mentioned in scenario.
 
 ### R3 — MISSING_USE_CASE (ERROR)
-Every action/function/feature in the scenario MUST appear as a use case oval.
-- List all actions from scenario. Check each one in shapes.
-- If a use case from scenario is not drawn → MISSING_USE_CASE error.
+Every action/function in the scenario needs a use case oval.
 
 ### R4 — EXTRA_USE_CASE (INFO)
-A use case oval exists but is not mentioned in scenario.
+Use case oval not mentioned in scenario.
 
 ### R5 — DISCONNECTED_ACTOR (ERROR)
-An actor exists but has NO association line to ANY use case.
-- Every actor must be connected to at least one use case.
+An actor has no line to any use case.
 
 ### R6 — ISOLATED_USE_CASE (ERROR)
-A use case oval exists but has NO connection to ANY actor (directly or via include/extend).
-- Every use case must be reachable from at least one actor.
+A use case has no connection to any actor (directly or via include/extend).
 
 ### R7 — MISSING_SYSTEM_BOUNDARY (ERROR)
-The system boundary rectangle is missing entirely.
-- Look for a shape of type "system_boundary" in the shapes list.
-- If NO system_boundary shape exists → report this error.
-- If a system_boundary shape exists → do NOT report this error.
+No system_boundary shape exists in the diagram.
 
 ### R8 — WRONG_RELATIONSHIP (ERROR)
-include/extend/generalization used incorrectly:
-- <<include>> = base use case ALWAYS calls included use case (mandatory).
-- <<extend>> = extension adds optional behavior to base use case.
-- Generalization between actors = one actor is a specialized version of another.
-- Report if these are reversed or misused.
+include/extend/generalization misused:
+- <<include>> = mandatory sub-function
+- <<extend>> = optional extension
 
 ### R9 — MISSING_VERB_IN_USE_CASE (WARNING)
-Use case names must start with or contain an action verb.
-- Bad: "Login Page", "Password" → Good: "Login", "Reset Password"
-- Report if a use case name has no verb.
+Use case name has no action verb (e.g. "Password" instead of "Reset Password").
 
-### R10 — DUPLICATE_ACTOR (ERROR)
-Same actor name appears more than once.
+### R10 — DUPLICATE_ACTOR / DUPLICATE_USE_CASE (ERROR)
+Same name appears more than once.
 
-### R11 — DUPLICATE_USE_CASE (ERROR)
-Same use case name appears more than once.
+## CONCISENESS RULE
+- "description": max 1 sentence.
+- "suggestion": max 1 sentence.
 
-### R12 — ACTOR_INSIDE_BOUNDARY (WARNING)
-Actors should be OUTSIDE the system boundary box, not inside it.
-
-## CRITICAL RULES TO AVOID FALSE POSITIVES
-- Do NOT report MISSING_ACTOR for roles that are only implied, not explicitly stated.
-- Do NOT report MISSING_USE_CASE for actions not mentioned in scenario.
-- Match names flexibly: "Place Order" matches "placeOrder" or "order placement".
-- Only report when you are CERTAIN it is a real mistake.
-
-## RESPONSE FORMAT (JSON only, no markdown fences)
+## RESPONSE FORMAT (pure JSON, no markdown)
 {{
   "errors": [
     {{
       "error_type": "RULE_CODE",
       "severity": "ERROR|WARNING|INFO",
-      "element": "affected element name",
-      "description": "Clear explanation of what is wrong",
-      "suggestion": "Exactly how to fix it",
+      "element": "element name",
+      "description": "One sentence: what is wrong.",
+      "suggestion": "One sentence: how to fix.",
       "auto_fix": {{
         "fixable": true,
         "action": "add_shape|delete_shape|rename_shape|add_arrow|add_boundary|merge_shapes",
@@ -462,105 +436,74 @@ Actors should be OUTSIDE the system boundary box, not inside it.
     }}
   ],
   "score": 0-100,
-  "summary": "X errors, Y warnings found"
+  "summary": "X errors, Y warnings."
 }}
 
-If diagram is fully correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
+If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct."}}
 """
 
 
 def _prompt_sequence(scenario: str, shapes: List[Dict]) -> str:
-    return f"""You are a strict UML Sequence Diagram validator. Your job is to find ALL real errors.
-
-## YOUR TASK
-1. Read the SCENARIO carefully.
-   - Identify every PARTICIPANT/OBJECT/SYSTEM mentioned → these need lifelines.
-   - Identify every INTERACTION/MESSAGE/CALL described → these need message arrows.
-   - Note the ORDER of interactions → sequence matters.
-2. Read the DIAGRAM SHAPES — these are what the student actually drew.
-3. Compare them: report every mismatch, missing element, and wrong sequence.
+    return f"""You are a strict UML Sequence Diagram validator. Find ALL real errors.
 
 ## SCENARIO
 {scenario}
 
-## DIAGRAM SHAPES (what student drew)
+## DIAGRAM SHAPES
 {json.dumps(shapes, indent=2)}
 
 ## HOW TO READ SHAPE DATA
-- "type": ToolType.lifeLine = lifeline, ToolType.arrow = solid message, ToolType.dashedArrow = return message
-- "text": for lifelines = participant name; for arrows = message label
-- "message_label": label on message arrow (same as text for arrows)
-- "arrow_type": "message_arrow" = solid call, "dashed_arrow" = return/response, "self_message" = self-call
-- "from" / "startLifeline": sender lifeline name
-- "to" / "endLifeline": receiver lifeline name
+- "type": "lifeline"/"object_lifeline" = vertical dashed lifeline; "arrow" = solid message; "dashed_arrow" = return message
+- "text": lifeline name or message label
+- "from" / "startLifeline": sender
+- "to" / "endLifeline": receiver
+- Shapes appear in draw order (top-to-bottom = earlier index)
 
-MESSAGE ORDER: Shapes appear in the JSON list in the order they were drawn.
-Top-to-bottom in diagram = earlier index in this list.
-
-## RULES TO CHECK
+## RULES
 
 ### R1 — MISSING_LIFELINE (ERROR)
-Every participant, object, or system mentioned in scenario MUST have a lifeline.
-- List all participants from scenario. Check each in shapes (lifeline or object_lifeline types).
-- If a participant is missing → MISSING_LIFELINE error.
+Every participant/object in scenario needs a lifeline.
 
 ### R2 — EXTRA_LIFELINE (WARNING)
-A lifeline exists that is not mentioned in scenario.
+A lifeline not mentioned in scenario.
 
 ### R3 — MISSING_MESSAGE (ERROR)
-Every significant interaction described in scenario MUST be shown as a message arrow.
-- List all interactions/calls from scenario. Check each in shapes (arrow types).
-- If an interaction is missing → MISSING_MESSAGE error.
-- Arrows are identified by their "text" or "label" field and by "from"/"to" lifelines.
+Every interaction in scenario needs a message arrow.
 
 ### R4 — WRONG_MESSAGE_ORDER (ERROR)
-Messages must appear in the correct chronological order as described in scenario.
-- If scenario says "A calls B, then B calls C" — check the vertical order of arrows.
-- If order is reversed → WRONG_MESSAGE_ORDER error.
+Messages not in the chronological order described in scenario.
 
 ### R5 — MISSING_RETURN (WARNING)
-For every synchronous call (solid arrow), there should be a return (dashed arrow) back.
-- If scenario explicitly describes a response/return → it MUST be drawn.
-- If scenario does not mention a return → only warn if it's clearly a request-response pattern.
+For synchronous calls, a dashed return arrow should be present if scenario implies a response.
 
 ### R6 — ISOLATED_LIFELINE (ERROR)
-A lifeline exists but sends AND receives NO messages at all.
-- Every lifeline must participate in at least one message.
+A lifeline sends AND receives zero messages.
 
 ### R7 — EMPTY_LIFELINE_NAME (ERROR)
-A lifeline shape has no name or empty/placeholder name.
+A lifeline has no name or placeholder name.
 
 ### R8 — INVALID_MESSAGE_SOURCE (ERROR)
-A message arrow starts from a lifeline that doesn't exist in the diagram.
+A message starts from a non-existent lifeline.
 
 ### R9 — INVALID_MESSAGE_TARGET (ERROR)
-A message arrow ends at a lifeline that doesn't exist in the diagram.
+A message targets a non-existent lifeline.
 
-### R10 — MISSING_ACTIVATION (WARNING)
-A lifeline that receives messages should have an activation box (activation_box shape).
-- Only report if activation boxes are used for other lifelines but missing for this one.
-- Do NOT report if no activation boxes are used anywhere in diagram.
+### R10 — MISSING_ALT_FRAGMENT (WARNING)
+Scenario has conditional logic but no combined fragment box.
 
-### R11 — MISSING_ALT_FRAGMENT (WARNING)
-If scenario describes conditional logic ("if", "when", "otherwise", "alternatively") →
-a combined_fragment (alt/opt) should be present.
-- Only report if the condition is clearly stated and important to the flow.
+## CONCISENESS RULE
+- "description": max 1 sentence.
+- "suggestion": max 1 sentence.
 
-## CRITICAL RULES TO AVOID FALSE POSITIVES
-- Match lifeline names flexibly (case-insensitive, partial match ok).
-- Do NOT report MISSING_RETURN unless scenario explicitly requires a response.
-- Do NOT assume interactions not mentioned in scenario.
-- Only report when you are CERTAIN it is a real mistake.
-
-## RESPONSE FORMAT (JSON only, no markdown fences)
+## RESPONSE FORMAT (pure JSON, no markdown)
 {{
   "errors": [
     {{
       "error_type": "RULE_CODE",
       "severity": "ERROR|WARNING|INFO",
-      "element": "affected element name",
-      "description": "Clear explanation of what is wrong",
-      "suggestion": "Exactly how to fix it",
+      "element": "element name",
+      "description": "One sentence: what is wrong.",
+      "suggestion": "One sentence: how to fix.",
       "auto_fix": {{
         "fixable": true,
         "action": "add_shape|rename_shape|add_arrow|merge_shapes",
@@ -574,10 +517,10 @@ a combined_fragment (alt/opt) should be present.
     }}
   ],
   "score": 0-100,
-  "summary": "X errors, Y warnings found"
+  "summary": "X errors, Y warnings."
 }}
 
-If diagram is fully correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
+If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct."}}
 """
 
 
@@ -594,73 +537,73 @@ def _build_prompt(diagram_type: str, scenario: str, shapes: List[Dict]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# IMPROVED IMAGE PROMPTS
+# IMAGE PROMPTS (Vision-based)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_image_prompt(diagram_type: str, scenario: str) -> str:
     dt = diagram_type.lower()
 
     if "usecase" in dt or "use_case" in dt:
-        return f"""You are a strict UML Use Case Diagram validator. You are given an IMAGE of the diagram.
-
-## YOUR TASK
-1. Read the SCENARIO carefully.
-   - List every PERSON/SYSTEM mentioned → these are required actors (stick figures).
-   - List every ACTION/FUNCTION mentioned → these are required use cases (ovals).
-2. Look carefully at the IMAGE — identify all drawn elements.
-3. Compare and report every mismatch.
+        return f"""You are a strict UML Use Case Diagram validator. Analyze this IMAGE carefully.
 
 ## SCENARIO
 {scenario}
 
-## WHAT TO CHECK IN THE IMAGE
+## WHAT TO LOOK FOR IN THE IMAGE
+
+ACTORS: Stick figures (human outline) with a name label below them.
+USE CASES: Oval/ellipse shapes with a name label inside them.
+SYSTEM BOUNDARY: A rectangle enclosing the use cases (actors are outside).
+CONNECTIONS: Lines between actors and ovals; dashed arrows with <<include>> or <<extend>> labels.
+
+## IMPORTANT — READ THE IMAGE CAREFULLY:
+- If you see a rectangle around the ovals → system boundary EXISTS, do NOT report it missing.
+- Identify EVERY stick figure → that is an actor.
+- Identify EVERY oval/ellipse → that is a use case.
+- Identify EVERY connection line between them.
+
+## CHECKS
 
 ### MISSING_ACTOR (ERROR)
-For each person/system in scenario: is a stick figure drawn with that name? If not → error.
+For each person/system in scenario: is a stick figure with that name drawn? If not → error.
 
 ### MISSING_USE_CASE (ERROR)
-For each action/function in scenario: is an oval drawn with that name? If not → error.
+For each action/function in scenario: is an oval with that name drawn? If not → error.
 
 ### DISCONNECTED_ACTOR (ERROR)
-Is any stick figure drawn with NO line connecting to any oval? If yes → error.
+Any stick figure with NO line to any oval → error.
 
 ### ISOLATED_USE_CASE (ERROR)
-Is any oval drawn with NO connection to any actor? If yes → error.
+Any oval with NO connection → error.
 
 ### MISSING_SYSTEM_BOUNDARY (ERROR)
-Is there a rectangle/box enclosing the use cases?
-- If you can clearly see a rectangle → do NOT report this.
-- If there is genuinely NO rectangle anywhere → report MISSING_SYSTEM_BOUNDARY.
+ONLY report if there is genuinely NO rectangle anywhere. If a rectangle exists → do NOT report.
 
 ### WRONG_RELATIONSHIP (ERROR)
-Are <<include>> or <<extend>> labels used correctly?
-- <<include>> = mandatory sub-function
-- <<extend>> = optional extension
+<<include>> or <<extend>> used incorrectly.
 
 ### MISSING_VERB_IN_USE_CASE (WARNING)
-Do any oval labels lack an action verb? (e.g., "Password" instead of "Reset Password")
-
-### DUPLICATE_ACTOR or DUPLICATE_USE_CASE (ERROR)
-Are any actor or use case names repeated?
+Oval label has no action verb.
 
 ### EXTRA_ACTOR (WARNING)
-Is any stick figure drawn that is NOT mentioned in scenario?
+Stick figure not mentioned in scenario.
 
 ### EXTRA_USE_CASE (INFO)
-Is any oval drawn that is NOT mentioned in scenario?
+Oval not mentioned in scenario.
 
-## SEVERITY
-ERROR = must fix | WARNING = should fix | INFO = suggestion
+## CONCISENESS
+- description: 1 sentence max.
+- suggestion: 1 sentence max.
 
-## RESPONSE FORMAT (JSON only, no markdown fences)
+## RESPONSE (pure JSON only, no markdown)
 {{
   "errors": [
     {{
       "error_type": "RULE_CODE",
       "severity": "ERROR|WARNING|INFO",
       "element": "element name",
-      "description": "What is wrong",
-      "suggestion": "How to fix",
+      "description": "One sentence.",
+      "suggestion": "One sentence.",
       "auto_fix": {{
         "fixable": true,
         "action": "add_shape|rename_shape|add_arrow|add_boundary|merge_shapes",
@@ -673,67 +616,61 @@ ERROR = must fix | WARNING = should fix | INFO = suggestion
     }}
   ],
   "score": 0-100,
-  "summary": "X errors, Y warnings found"
+  "summary": "X errors, Y warnings."
 }}
 
-If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
+If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct."}}
 """
 
     elif "sequence" in dt:
-        return f"""You are a strict UML Sequence Diagram validator. You are given an IMAGE of the diagram.
-
-## YOUR TASK
-1. Read the SCENARIO carefully.
-   - List every PARTICIPANT/OBJECT mentioned → these need vertical dashed lifelines.
-   - List every INTERACTION/MESSAGE described → these need horizontal arrows.
-   - Note the ORDER of interactions.
-2. Look carefully at the IMAGE — identify all drawn elements.
-3. Compare and report every mismatch.
+        return f"""You are a strict UML Sequence Diagram validator. Analyze this IMAGE carefully.
 
 ## SCENARIO
 {scenario}
 
-## WHAT TO CHECK IN THE IMAGE
+## WHAT TO LOOK FOR IN THE IMAGE
+
+LIFELINES: Vertical dashed lines with a name box/label at the top.
+MESSAGES: Horizontal arrows between lifelines, with a label on/above the arrow.
+RETURN MESSAGES: Dashed horizontal arrows going back.
+ACTIVATION BOXES: Narrow rectangles on lifelines showing when a participant is active.
+
+## CHECKS
 
 ### MISSING_LIFELINE (ERROR)
-For each participant in scenario: is a vertical dashed line drawn with that name? If not → error.
+For each participant in scenario: is a vertical dashed line with that name drawn? If not → error.
 
 ### MISSING_MESSAGE (ERROR)
-For each interaction in scenario: is a horizontal arrow drawn for it? If not → error.
-Check arrow labels — they should match the interaction names in scenario.
+For each interaction in scenario: is a horizontal arrow with a matching label drawn? If not → error.
 
 ### WRONG_MESSAGE_ORDER (ERROR)
-Are the message arrows in the correct top-to-bottom order as described in scenario?
-If scenario says "A then B then C" but diagram shows different order → error.
+Messages not in the top-to-bottom order described in scenario.
 
 ### MISSING_RETURN (WARNING)
-For request-response interactions: is there a dashed return arrow back?
-Only report if scenario clearly implies a response.
+Synchronous call has no dashed return arrow when scenario implies a response.
 
 ### ISOLATED_LIFELINE (ERROR)
-Is any lifeline drawn that sends AND receives zero messages?
+A lifeline has no messages at all.
 
 ### EMPTY_LIFELINE_NAME (ERROR)
-Is any lifeline drawn without a name label?
-
-### MISSING_ALT_FRAGMENT (WARNING)
-If scenario has conditional logic (if/else, optional steps): is there a combined fragment box?
+A lifeline has no name label.
 
 ### EXTRA_LIFELINE (WARNING)
-Is any lifeline drawn that is NOT mentioned in scenario?
+A lifeline not mentioned in scenario.
 
-## SEVERITY
-ERROR = must fix | WARNING = should fix | INFO = suggestion
+## CONCISENESS
+- description: 1 sentence max.
+- suggestion: 1 sentence max.
 
-## RESPONSE FORMAT (JSON only, no markdown fences)
+## RESPONSE (pure JSON only, no markdown)
 {{
   "errors": [
     {{
       "error_type": "RULE_CODE",
       "severity": "ERROR|WARNING|INFO",
       "element": "element name",
-      "description": "What is wrong",
-      "suggestion": "How to fix",
+      "description": "One sentence.",
+      "suggestion": "One sentence.",
       "auto_fix": {{
         "fixable": true,
         "action": "add_shape|rename_shape|add_arrow",
@@ -747,75 +684,91 @@ ERROR = must fix | WARNING = should fix | INFO = suggestion
     }}
   ],
   "score": 0-100,
-  "summary": "X errors, Y warnings found"
+  "summary": "X errors, Y warnings."
 }}
 
-If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
+If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct."}}
 """
 
     else:  # class diagram
-        return f"""You are a strict UML Class Diagram validator. You are given an IMAGE of the diagram.
-
-## YOUR TASK
-1. Read the SCENARIO carefully.
-   - List every important NOUN/ENTITY → these need class boxes.
-   - Note every RELATIONSHIP described between entities.
-2. Look carefully at the IMAGE — identify all drawn class boxes, arrows, labels.
-3. Compare and report every mismatch.
+        return f"""You are a strict UML Class Diagram validator. Analyze this IMAGE carefully.
 
 ## SCENARIO
 {scenario}
 
-## WHAT TO CHECK IN THE IMAGE
+## WHAT TO LOOK FOR IN THE IMAGE
+
+CLASS BOXES: Rectangles divided into 3 horizontal sections.
+  - TOP section = CLASS NAME (this is the only class name — ignore attributes/methods below)
+  - MIDDLE section = attributes (e.g. studentId, name) — these are NOT class names
+  - BOTTOM section = methods (e.g. login(), getGrade()) — these are NOT class names
+
+RELATIONSHIP ARROWS (look carefully at the arrowhead style):
+  - Solid line + open hollow triangle → GENERALIZATION (inheritance)
+  - Solid line + open arrowhead → ASSOCIATION
+  - Solid line + filled diamond at source → COMPOSITION
+  - Solid line + open diamond at source → AGGREGATION
+  - Dashed line + open arrowhead → DEPENDENCY
+
+MULTIPLICITY LABELS: Numbers/symbols near both ends of relationship arrows (e.g. "1", "*", "1..*").
+RELATIONSHIP LABELS: Text in the middle of relationship lines (e.g. "teaches", "manages").
+
+## CRITICAL READING RULES
+1. The CLASS NAME is ONLY the text in the TOP section of a class box.
+2. Text in the MIDDLE or BOTTOM section = attributes/methods — NEVER treat these as missing classes.
+3. If a word from the scenario appears as an attribute inside a class box → it is NOT a missing class.
+4. Identify the ACTUAL arrowhead style before reporting wrong relationship type.
+
+## CHECKS
 
 ### MISSING_CLASS (ERROR)
-For each important noun/entity in scenario: is a class box drawn with that name?
-- Class boxes have 3 sections: top=name, middle=attributes, bottom=methods.
-- The CLASS NAME is only the text in the TOP section.
-- Do NOT treat attribute names (camelCase like studentId) as class names.
-- Do NOT treat method names (ending with ()) as class names.
+For each entity in scenario: is a class box with that name (in TOP section) drawn?
+- Do NOT report if the entity appears as an attribute inside a class.
 
 ### MISSING_RELATIONSHIP (ERROR)
-For each relationship described in scenario: is the correct arrow drawn?
-- "has/contains/owns" → association or composition arrow
-- "is a / inherits" → generalization arrow (hollow triangle head)
-- "uses/depends" → dashed dependency arrow
+For each relationship in scenario: is the correct arrow drawn between those classes?
 
 ### WRONG_RELATIONSHIP (ERROR)
-Is the drawn arrow type correct for the scenario?
-- "part of / consists of" → must be composition (filled diamond), not plain association
-- "is a" → must be generalization (hollow arrow), not association
+An arrow exists but uses the WRONG type:
+- "consists of"/"part of" → must be COMPOSITION (filled diamond), not association
+- "is a"/"inherits" → must be GENERALIZATION (hollow triangle), not association
+- "has many"/"collection of" → must be AGGREGATION (open diamond)
+Report the drawn type and the required type.
+
+### WRONG_MULTIPLICITY (WARNING)
+Multiplicity values exist but are incorrect for the scenario (e.g. "1" drawn but should be "*").
 
 ### MISSING_MULTIPLICITY (WARNING)
-Do all association/aggregation/composition arrows have multiplicity labels on BOTH ends?
-Look for numbers like "1", "*", "1..*", "0..1" near each end of every relationship arrow.
-If any end is missing a multiplicity label → report.
+Association/aggregation/composition arrow has no multiplicity label at one or both ends.
+
+### WRONG_ASSOCIATION_LABEL (WARNING)
+Arrow has a label that doesn't match what the scenario describes for that relationship.
 
 ### WRONG_INHERITANCE (ERROR)
-Generalization arrow must point FROM child TO parent (hollow triangle at parent end).
-If reversed → error.
+Generalization arrow points FROM parent TO child (should be child → parent with hollow triangle at parent).
 
 ### DUPLICATE_CLASS (ERROR)
-Same class name appears more than once.
+Same class name in more than one box.
 
 ### EMPTY_CLASS_NAME (ERROR)
-Any class box with no name or placeholder name like "Class1".
+A class box with no name or placeholder name.
 
 ### EXTRA_CLASS (WARNING)
-A class box exists but is not mentioned in scenario at all.
+A class box not mentioned in scenario.
 
-## SEVERITY
-ERROR = must fix | WARNING = should fix | INFO = suggestion
+## CONCISENESS
+- description: 1 sentence max.
+- suggestion: 1 sentence max.
 
-## RESPONSE FORMAT (JSON only, no markdown fences)
+## RESPONSE (pure JSON only, no markdown)
 {{
   "errors": [
     {{
       "error_type": "RULE_CODE",
       "severity": "ERROR|WARNING|INFO",
-      "element": "element name",
-      "description": "What is wrong",
-      "suggestion": "How to fix",
+      "element": "element name or 'ClassA → ClassB'",
+      "description": "One sentence: what is wrong.",
+      "suggestion": "One sentence: how to fix.",
       "auto_fix": {{
         "fixable": true,
         "action": "add_shape|delete_shape|rename_shape|add_arrow|change_arrow_type|add_label|merge_shapes",
@@ -830,10 +783,10 @@ ERROR = must fix | WARNING = should fix | INFO = suggestion
     }}
   ],
   "score": 0-100,
-  "summary": "X errors, Y warnings found"
+  "summary": "X errors, Y warnings."
 }}
 
-If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
+If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct."}}
 """
 
 
@@ -1030,11 +983,12 @@ def _build_result(result: Dict, diagram_type: str, source: str) -> Dict[str, Any
 # PUBLIC API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def validate_with_openai(
+def validate_with_gemini(
     scenario:     str,
     shapes:       List[Dict[str, Any]],
     diagram_type: str = "class",
 ) -> Optional[Dict[str, Any]]:
+    """Text-based (shapes JSON) validation. Called 'gemini' for backward compat."""
     api_key = _get_api_key()
     if not api_key:
         _log.warning("OPENAI_API_KEY not set — skipping AI validation")
@@ -1056,12 +1010,17 @@ def validate_with_openai(
     return None
 
 
-def validate_with_openai_image(
+# Alias used by app.py
+validate_with_openai = validate_with_gemini
+
+
+def validate_with_gemini_image(
     scenario:     str,
     image_b64:    str,
     mime_type:    str = "image/png",
     diagram_type: str = "class",
 ) -> Optional[Dict[str, Any]]:
+    """Vision-based (image upload) validation."""
     api_key = _get_api_key()
     if not api_key:
         _log.warning("OPENAI_API_KEY not set — skipping image validation")
@@ -1079,3 +1038,7 @@ def validate_with_openai_image(
 
     _log.error("All Vision models failed!")
     return None
+
+
+# Alias used by app.py
+validate_with_openai_image = validate_with_gemini_image
