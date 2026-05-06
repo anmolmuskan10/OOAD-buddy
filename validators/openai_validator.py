@@ -747,7 +747,7 @@ def _call_model(prompt: str, api_key: str, model: str) -> Optional[Dict]:
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def validate_with_gemini(
+def validate_with_openai(
     scenario:     str,
     shapes:       List[Dict[str, Any]],
     diagram_type: str = "class",
@@ -1008,7 +1008,7 @@ def _call_model_with_image(prompt: str, image_b64: str, mime_type: str, api_key:
         return None
 
 
-def validate_with_gemini_image(
+def validate_with_openai_image(
     scenario:     str,
     image_b64:    str,
     mime_type:    str = "image/png",
