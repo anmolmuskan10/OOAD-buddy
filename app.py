@@ -6,6 +6,8 @@ All 3 diagram types: class, usecase, sequence
 FIX: Image upload se diagram_type auto-detect via Gemini Vision.
      Agar diagram_type missing/unknown ho toh image analyse karke
      automatically pata lagta hai ke class/usecase/sequence hai.
+
+UPDATE: gpt-4o -> gpt-4o-mini (rate limit fix), timeout 120s, retry logic added
 """
 
 import os
@@ -13,6 +15,7 @@ import re
 import json
 import base64
 import logging
+import time
 import urllib.request
 import urllib.error
 from flask import Flask, request, jsonify
@@ -33,8 +36,9 @@ extractor = NLPExtractor()
 
 # OpenAI API config
 _OPENAI_API_BASE = "https://api.openai.com/v1"
-_VISION_MODELS   = ["gpt-4o"]
-_TIMEOUT         = 60
+_VISION_MODELS   = ["gpt-4o-mini"]   # FIX: gpt-4o-mini use karo (sasta + zyada rate limit)
+_TIMEOUT         = 120               # FIX: 60 se badha ke 120 kiya (worker crash band)
+_RETRY_WAIT      = 65                # Rate limit pe wait seconds
 
 
 def _get_api_key():
@@ -43,7 +47,7 @@ def _get_api_key():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  AUTO-DETECT diagram type from image using Gemini Vision
+#  AUTO-DETECT diagram type from image using OpenAI Vision
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _detect_diagram_type_from_image(image_b64: str, mime_type: str = "image/png") -> str:
@@ -68,7 +72,7 @@ Reply with ONLY one word - exactly one of: class, usecase, sequence
 Do not explain. Just the single word."""
 
     payload = json.dumps({
-        "model": "gpt-4o",
+        "model": "gpt-4o-mini",   # FIX: gpt-4o-mini use karo
         "messages": [{
             "role": "user",
             "content": [
@@ -90,19 +94,33 @@ Do not explain. Just the single word."""
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-            text = body["choices"][0]["message"]["content"].strip().lower()
-            text = re.sub(r"[^a-z]", "", text.split()[0] if text.split() else "")
-            if text in ("class", "usecase", "sequence"):
-                _log.info("Auto-detected diagram type: '%s' (model: %s)", text, model)
-                return text
-            if "class" in text:   return "class"
-            if "use" in text:     return "usecase"
-            if "seq" in text:     return "sequence"
-        except Exception as e:
-            _log.warning("Vision model %s failed: %s", model, e)
+        # FIX: Retry logic - rate limit pe dobara try karo
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                text = body["choices"][0]["message"]["content"].strip().lower()
+                text = re.sub(r"[^a-z]", "", text.split()[0] if text.split() else "")
+                if text in ("class", "usecase", "sequence"):
+                    _log.info("Auto-detected diagram type: '%s' (model: %s)", text, model)
+                    return text
+                if "class" in text:   return "class"
+                if "use" in text:     return "usecase"
+                if "seq" in text:     return "sequence"
+                break  # response mila, loop band karo
+            except urllib.error.HTTPError as e:
+                if e.code == 429:  # Rate limit error
+                    if attempt < 2:
+                        _log.warning("Rate limit hit (attempt %d/3) - waiting %ds...", attempt + 1, _RETRY_WAIT)
+                        time.sleep(_RETRY_WAIT)
+                    else:
+                        _log.error("Rate limit - 3 attempts failed for model %s", model)
+                else:
+                    _log.warning("Vision model %s HTTP error %d: %s", model, e.code, e)
+                    break
+            except Exception as e:
+                _log.warning("Vision model %s failed: %s", model, e)
+                break
 
     _log.warning("Could not auto-detect diagram type - defaulting to 'class'")
     return "class"
@@ -130,7 +148,7 @@ def index():
     return jsonify({
         "message": "OOAD Hybrid Validation Engine",
         "status":  "running",
-        "mode":    "OpenAI GPT-4o (primary) + Rule-Based (fallback)",
+        "mode":    "OpenAI GPT-4o-mini (primary) + Rule-Based (fallback)",
         "features": {
             "image_auto_detect": "Upload image -> OpenAI Vision auto-detects diagram type",
             "diagram_types":     ["class", "usecase", "sequence"],
@@ -223,11 +241,11 @@ def validate():
     # ── NLP extraction ─────────────────────────────────────────────────────
     extracted = extractor.extract(scenario)
 
-    # ── Gemini AI first (PRIMARY) ──────────────────────────────────────────
-    # Jab image available ho → Gemini Vision use karo (image directly analyze)
-    # Jab sirf shapes hon → text-based Gemini use karo
+    # ── OpenAI AI first (PRIMARY) ──────────────────────────────────────────
+    # Jab image available ho → OpenAI Vision use karo (image directly analyze)
+    # Jab sirf shapes hon → text-based OpenAI use karo
     if image_b64:
-        _log.info("Image available — using Gemini Vision for '%s' diagram", dtype)
+        _log.info("Image available — using OpenAI Vision for '%s' diagram", dtype)
         gemini_result = validate_with_openai_image(
             scenario=scenario,
             image_b64=image_b64,
