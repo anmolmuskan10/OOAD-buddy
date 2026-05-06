@@ -445,7 +445,7 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
         "calculate","cancel","change","check","close","complete","confirm",
         "create","delete","display","download","edit","enter","export",
         "filter","generate","get","handle","import","initiate","insert",
-        "launch","list","log","login","logout","make","manage","modify","monitor",
+        "launch","list","log","login","logout","manage","modify","monitor",
         "notify","open","pay","perform","place","print","process","provide",
         "purchase","read","receive","register","remove","request","reset",
         "retrieve","review","save","search","select","send","set","show",
@@ -685,6 +685,16 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
         # Drop if user has ignored this error previously
         if _error_fingerprint(e) in ignored_set:
             return False
+
+        # Drop WRONG_SYSTEM_BOUNDARY_NAME if the names differ only by case
+        if et == "wrong_system_boundary_name":
+            desc = str(e.get("description", ""))
+            # Extract both names from description: "named 'X' but scenario calls it 'Y'"
+            import re as _re2
+            names_found = _re2.findall(r"'([^']+)'", desc)
+            if len(names_found) >= 2:
+                if _n(names_found[0]) == _n(names_found[1]):
+                    return False  # same name, just different case — not a real error
 
         # Drop if LLM says element is MISSING but it exists in shapes (hallucination)
         if "missing" in et and elem and elem in existing:
@@ -1050,7 +1060,6 @@ DO NOT CHECK AND DO NOT REPORT:
   → Suggestion: "Change the system boundary name from 'X' to 'Y'." (never say "add a new boundary")
 - If system boundary does NOT exist at all → report MISSING_SYSTEM_BOUNDARY.
 - If system boundary exists with correct name → no error.
-- STRICT: Name matching is 100% CASE-INSENSITIVE and ignores extra spaces. 'Online Shopping System' == 'online shopping system' — these are the SAME. Do NOT report WRONG_SYSTEM_BOUNDARY_NAME for case differences only.
 
 ## SEVERITY
 ERROR = must fix | WARNING = should fix | INFO = suggestion
@@ -1567,8 +1576,7 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 ## SYSTEM BOUNDARY NAME RULE:
 - If boundary EXISTS with wrong name → report WRONG_SYSTEM_BOUNDARY_NAME, suggest renaming.
 - If boundary does NOT exist → report MISSING_SYSTEM_BOUNDARY.
-- Never report both for the same diagram.
-- STRICT: Name matching is 100% CASE-INSENSITIVE. 'Online Shopping System' == 'online shopping system' — do NOT report WRONG_SYSTEM_BOUNDARY_NAME for case differences only."""
+- Never report both for the same diagram."""
 
     elif "sequence" in dt:
         rules = """1. MISSING_LIFELINE — Every participant in scenario must have a lifeline or object box.
