@@ -299,19 +299,33 @@ The arrow DRAWN between two classes uses the WRONG type vs what the scenario imp
 - "uses" / "depends on" → must be "dependency"
 - Report: WRONG_RELATIONSHIP with element = "ClassA → ClassB", description = "Used [drawn_type] but scenario implies [correct_type]."
 
-### R5 — WRONG_MULTIPLICITY (WARNING) ← IMPORTANT
-An arrow exists and has multiplicity fields, but the VALUES are incorrect for the scenario.
+### R5 — MISSING_MULTIPLICITY (WARNING) ← CRITICAL — ALWAYS CHECK THIS
+For EVERY association_arrow, aggregation_arrow, composition_arrow shape in diagram:
+- Check if "multiplicity_start" field EXISTS in the shape JSON.
+- Check if "multiplicity_end" field EXISTS in the shape JSON.
+- If EITHER field is ABSENT (not present in JSON) → report MISSING_MULTIPLICITY as WARNING.
+- element = "ClassA → ClassB" (use from/to fields of that arrow).
+- Do this for ALL relationship arrows without exception. Do NOT skip any arrow.
+- Example: arrow {"type":"association_arrow","from":"Customer","to":"Order"} has no multiplicity_start or multiplicity_end → report MISSING_MULTIPLICITY for "Customer → Order".
+
+### R5b — WRONG_MULTIPLICITY (WARNING)
+An arrow has multiplicity fields but the VALUES are wrong vs scenario.
 - e.g. Scenario says "one customer places many orders" → must be 1 on Customer end, * on Order end.
 - If drawn multiplicity doesn't match → report WRONG_MULTIPLICITY.
-- Also report MISSING_MULTIPLICITY if either "multiplicity_start" or "multiplicity_end" field is absent.
 
-### R6 — WRONG_ASSOCIATION_LABEL (WARNING) ← IMPORTANT
-An association arrow has a "relationship_label" that does not match what the scenario describes.
-- e.g. Scenario says "Teacher teaches Student" but label is "manages" → WRONG_ASSOCIATION_LABEL.
-- Also report MISSING_ASSOCIATION_LABEL if scenario mentions a label but none is drawn.
+### R6 — WRONG_ASSOCIATION_LABEL (WARNING)
+An association arrow "relationship_label" does not match what scenario describes.
+- Also report MISSING_ASSOCIATION_LABEL if scenario mentions a named relationship but no label is drawn.
 
-### R7 — WRONG_INHERITANCE (ERROR)
-Generalization arrow must go FROM child TO parent. If reversed → error.
+### R7 — WRONG_INHERITANCE (ERROR) ← CRITICAL — ALWAYS CHECK
+Generalization arrow MUST go FROM child class TO parent class (arrowhead at parent).
+- Check EVERY generalization_arrow in the diagram.
+- "from" field = source (must be CHILD), "to" field = target (must be PARENT).
+- If "from" is the PARENT and "to" is the CHILD → arrow is REVERSED → WRONG_INHERITANCE ERROR.
+- Example WRONG: from="Animal", to="Fish" means arrow goes Animal→Fish → Fish is not parent → REVERSED → ERROR.
+- Example CORRECT: from="Fish", to="Animal" → Fish inherits from Animal → OK.
+- element = "ChildClass → ParentClass", description = "Generalization arrow direction is reversed; it must go from child to parent."
+- auto_fix: fixable: false (user must fix manually).
 
 ### R8 — DUPLICATE_CLASS (ERROR)
 Same class name appears more than once.
@@ -385,31 +399,57 @@ Every person/external system in the scenario needs an actor shape.
 ### R2 — EXTRA_ACTOR (WARNING)
 Actor in diagram not mentioned in scenario.
 
-### R3 — MISSING_USE_CASE (ERROR)
-Every action/function in the scenario needs a use case oval.
+### R3 — MISSING_USE_CASE (ERROR) ← CRITICAL — ALWAYS CHECK
+Extract EVERY action/function from the scenario text.
+Then check: does a use_case_oval shape exist with matching or similar text?
+- Compare scenario actions vs use_case_oval "text" fields.
+- If a scenario action has NO matching oval → report MISSING_USE_CASE ERROR.
+- element = the missing use case name from scenario.
+- Example: scenario says "track deliveries" but no oval with "track" or "deliver" text → MISSING_USE_CASE ERROR.
+- Be thorough: list ALL scenario actions first, then check each one against diagram ovals.
+
+### R3b — SPELLING_MISTAKE (WARNING) ← CHECK THIS
+Compare use case oval text vs scenario text carefully.
+- If oval text is a misspelling of a scenario action → report SPELLING_MISTAKE WARNING.
+- element = the oval name, description = "Misspelled: 'X' should be 'Y'".
+- Example: oval says "place ordy" but scenario says "place order" → SPELLING_MISTAKE.
+- Example: oval says "manage cart" and scenario says "manage shopping cart" → acceptable match, do NOT report.
 
 ### R4 — EXTRA_USE_CASE (INFO)
 Use case oval not mentioned in scenario.
 
-### R5 — DISCONNECTED_ACTOR (ERROR)
-An actor has no line to any use case.
+### R5 — DISCONNECTED_ACTOR (ERROR) ← ALWAYS CHECK
+Check EVERY actor shape: does it have at least one arrow (from/to) connecting to a use case oval?
+- If an actor has no connections at all → DISCONNECTED_ACTOR ERROR.
+- Look at all arrow shapes: does any arrow have "from" or "to" matching this actor's text?
+- If no arrow connects to this actor → report DISCONNECTED_ACTOR.
 
-### R6 — ISOLATED_USE_CASE (ERROR)
-A use case has no connection to any actor (directly or via include/extend).
+### R6 — ISOLATED_USE_CASE (ERROR) ← ALWAYS CHECK
+Check EVERY use_case_oval shape: does it have at least one arrow connecting to it?
+- Look at all arrow shapes: does any arrow have "from" or "to" matching this oval's text?
+- If no arrow connects to this oval → ISOLATED_USE_CASE ERROR.
+- An oval with empty/blank text also counts as isolated if unlabeled.
+
+### R6b — EMPTY_USE_CASE_LABEL (ERROR)
+A use_case_oval has no text or empty text → report EMPTY_USE_CASE_LABEL ERROR.
+- element = "Unlabeled use case oval"
 
 ### R7 — MISSING_SYSTEM_BOUNDARY (ERROR)
-No system_boundary shape exists in the diagram.
+No system_boundary shape exists in the diagram shapes list.
 
 ### R8 — WRONG_RELATIONSHIP (ERROR)
 include/extend/generalization misused:
-- <<include>> = mandatory sub-function
-- <<extend>> = optional extension
+- <<include>> = mandatory sub-function always executed
+- <<extend>> = optional extension under certain conditions
 
 ### R9 — MISSING_VERB_IN_USE_CASE (WARNING)
-Use case name has no action verb (e.g. "Password" instead of "Reset Password").
+Use case oval name has no action verb (e.g. "Payment" instead of "Make Payment").
+- Check EVERY use_case_oval text for an action verb.
+- Common non-verb names: "Password", "Payment", "Cart", "Order" → report WARNING.
+- Acceptable: "Browse Products", "Make Payment", "Place Order" → OK.
 
 ### R10 — DUPLICATE_ACTOR / DUPLICATE_USE_CASE (ERROR)
-Same name appears more than once.
+Same name appears more than once in actor shapes or use_case_oval shapes.
 
 ## CONCISENESS RULE
 - "description": max 1 sentence.
