@@ -1385,7 +1385,7 @@ def _call_model(prompt: str, api_key: str, model: str) -> Optional[Dict]:
         ],
         "temperature": 0,
         "seed": 42,
-        "max_tokens": 8192,
+        "max_tokens": 1500,
     }).encode("utf-8")
 
     req = urllib.request.Request(
@@ -1745,7 +1745,7 @@ def _call_model_with_image(prompt: str, image_b64: str, mime_type: str, api_key:
         ],
         "temperature": 0,
         "seed": 42,
-        "max_tokens": 8192,
+        "max_tokens": 1500,
     }).encode("utf-8")
 
     req = urllib.request.Request(
