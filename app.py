@@ -22,7 +22,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 from nlp_extractor import NLPExtractor
-from validators.openai_validator import validate_with_gemini, validate_with_gemini_image
+from validators.openai_validator import validate_with_openai, validate_with_openai_image
 
 logging.basicConfig(level=logging.INFO)
 _log = logging.getLogger(__name__)
@@ -219,14 +219,14 @@ def validate():
     # Jab sirf shapes hon → text-based Gemini use karo
     if image_b64:
         _log.info("Image available — using Gemini Vision for '%s' diagram", dtype)
-        gemini_result = validate_with_gemini_image(
+        gemini_result = validate_with_openai_image(
             scenario=scenario,
             image_b64=image_b64,
             mime_type=mime_type,
             diagram_type=dtype,
         )
     else:
-        gemini_result = validate_with_gemini(scenario, shapes, diagram_type=dtype)
+        gemini_result = validate_with_openai(scenario, shapes, diagram_type=dtype)
 
     if gemini_result:
         _log.info("OpenAI validation used for '%s' diagram", dtype)
