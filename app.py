@@ -1,13 +1,14 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 """
 OOAD Diagram Validation Engine - Flask Backend
-Hybrid Validation: Gemini AI (primary) + Rule-Based (fallback)
+OpenAI GPT-4o Validation Only
 All 3 diagram types: class, usecase, sequence
 
 FIX: Image upload se diagram_type auto-detect via Gemini Vision.
      Agar diagram_type missing/unknown ho toh image analyse karke
      automatically pata lagta hai ke class/usecase/sequence hai.
-
-UPDATE: gpt-4o -> gpt-4o-mini (rate limit fix), timeout 120s, retry logic added
 """
 
 import os
@@ -15,17 +16,13 @@ import re
 import json
 import base64
 import logging
-import time
 import urllib.request
 import urllib.error
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 from nlp_extractor import NLPExtractor
-from validators.class_validator import ClassDiagramValidator
-from validators.usecase_validator import UseCaseValidator
-from validators.sequence_validator import SequenceDiagramValidator
-from validators.openai_validator import validate_with_openai, validate_with_openai_image
+from validators.openai_validator import validate_with_gemini, validate_with_gemini_image
 
 logging.basicConfig(level=logging.INFO)
 _log = logging.getLogger(__name__)
@@ -36,9 +33,8 @@ extractor = NLPExtractor()
 
 # OpenAI API config
 _OPENAI_API_BASE = "https://api.openai.com/v1"
-_VISION_MODELS   = ["gpt-4o-mini"]   # FIX: gpt-4o-mini use karo (sasta + zyada rate limit)
-_TIMEOUT         = 120               # FIX: 60 se badha ke 120 kiya (worker crash band)
-_RETRY_WAIT      = 65                # Rate limit pe wait seconds
+_VISION_MODELS   = ["gpt-4o"]
+_TIMEOUT         = 60
 
 
 def _get_api_key():
@@ -47,7 +43,7 @@ def _get_api_key():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  AUTO-DETECT diagram type from image using OpenAI Vision
+#  AUTO-DETECT diagram type from image using Gemini Vision
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _detect_diagram_type_from_image(image_b64: str, mime_type: str = "image/png") -> str:
@@ -72,7 +68,7 @@ Reply with ONLY one word - exactly one of: class, usecase, sequence
 Do not explain. Just the single word."""
 
     payload = json.dumps({
-        "model": "gpt-4o-mini",   # FIX: gpt-4o-mini use karo
+        "model": "gpt-4o",
         "messages": [{
             "role": "user",
             "content": [
@@ -94,33 +90,19 @@ Do not explain. Just the single word."""
             },
             method="POST",
         )
-        # FIX: Retry logic - rate limit pe dobara try karo
-        for attempt in range(3):
-            try:
-                with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-                    body = json.loads(resp.read().decode("utf-8"))
-                text = body["choices"][0]["message"]["content"].strip().lower()
-                text = re.sub(r"[^a-z]", "", text.split()[0] if text.split() else "")
-                if text in ("class", "usecase", "sequence"):
-                    _log.info("Auto-detected diagram type: '%s' (model: %s)", text, model)
-                    return text
-                if "class" in text:   return "class"
-                if "use" in text:     return "usecase"
-                if "seq" in text:     return "sequence"
-                break  # response mila, loop band karo
-            except urllib.error.HTTPError as e:
-                if e.code == 429:  # Rate limit error
-                    if attempt < 2:
-                        _log.warning("Rate limit hit (attempt %d/3) - waiting %ds...", attempt + 1, _RETRY_WAIT)
-                        time.sleep(_RETRY_WAIT)
-                    else:
-                        _log.error("Rate limit - 3 attempts failed for model %s", model)
-                else:
-                    _log.warning("Vision model %s HTTP error %d: %s", model, e.code, e)
-                    break
-            except Exception as e:
-                _log.warning("Vision model %s failed: %s", model, e)
-                break
+        try:
+            with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            text = body["choices"][0]["message"]["content"].strip().lower()
+            text = re.sub(r"[^a-z]", "", text.split()[0] if text.split() else "")
+            if text in ("class", "usecase", "sequence"):
+                _log.info("Auto-detected diagram type: '%s' (model: %s)", text, model)
+                return text
+            if "class" in text:   return "class"
+            if "use" in text:     return "usecase"
+            if "seq" in text:     return "sequence"
+        except Exception as e:
+            _log.warning("Vision model %s failed: %s", model, e)
 
     _log.warning("Could not auto-detect diagram type - defaulting to 'class'")
     return "class"
@@ -146,9 +128,9 @@ def _normalize_dtype(raw: str) -> str:
 @app.route('/', methods=['GET'])
 def index():
     return jsonify({
-        "message": "OOAD Hybrid Validation Engine",
+        "message": "OOAD Validation Engine",
         "status":  "running",
-        "mode":    "OpenAI GPT-4o-mini (primary) + Rule-Based (fallback)",
+        "mode":    "OpenAI GPT-4o only",
         "features": {
             "image_auto_detect": "Upload image -> OpenAI Vision auto-detects diagram type",
             "diagram_types":     ["class", "usecase", "sequence"],
@@ -229,44 +211,33 @@ def validate():
                 )
             }), 400
 
-    # Select rule-based validator
-    if dtype == "usecase":
-        rule_validator = UseCaseValidator()
-    elif dtype == "sequence":
-        rule_validator = SequenceDiagramValidator()
-    else:
-        dtype = "class"
-        rule_validator = ClassDiagramValidator()
-
     # ── NLP extraction ─────────────────────────────────────────────────────
     extracted = extractor.extract(scenario)
 
-    # ── OpenAI AI first (PRIMARY) ──────────────────────────────────────────
-    # Jab image available ho → OpenAI Vision use karo (image directly analyze)
-    # Jab sirf shapes hon → text-based OpenAI use karo
+    # ── Gemini AI first (PRIMARY) ──────────────────────────────────────────
+    # Jab image available ho → Gemini Vision use karo (image directly analyze)
+    # Jab sirf shapes hon → text-based Gemini use karo
     if image_b64:
-        _log.info("Image available — using OpenAI Vision for '%s' diagram", dtype)
-        gemini_result = validate_with_openai_image(
+        _log.info("Image available — using Gemini Vision for '%s' diagram", dtype)
+        gemini_result = validate_with_gemini_image(
             scenario=scenario,
             image_b64=image_b64,
             mime_type=mime_type,
             diagram_type=dtype,
         )
     else:
-        gemini_result = validate_with_openai(scenario, shapes, diagram_type=dtype)
+        gemini_result = validate_with_gemini(scenario, shapes, diagram_type=dtype)
 
     if gemini_result:
         _log.info("OpenAI validation used for '%s' diagram", dtype)
         gemini_result["validation_mode"] = "openai"
         final_result = gemini_result
     else:
-        # Fallback to rule-based
-        _log.warning("OpenAI unavailable - rule-based fallback for '%s'", dtype)
-        rule_result = rule_validator.validate(extracted, shapes)
-        rule_result["validation_mode"] = "rule-based (OpenAI unavailable)"
-        # Rule-based has no auto_fix — set fixable_count to 0
-        rule_result.setdefault("fixable_count", 0)
-        final_result = rule_result
+        _log.error("OpenAI validation unavailable for '%s' diagram", dtype)
+        return jsonify({
+            "error": "OpenAI validation is currently unavailable. Please try again.",
+            "diagram_type": dtype,
+        }), 503
 
     return jsonify({
         "diagram_type":        dtype,
@@ -290,7 +261,7 @@ def extract_only():
 if __name__ == '__main__':
     key = _get_api_key()
     if not key:
-        _log.warning("OPENAI_API_KEY not set - rule-based only. Image auto-detect DISABLED.")
+        _log.warning("OPENAI_API_KEY not set - validation and image auto-detect DISABLED.")
     else:
         _log.info("OpenAI API key found - AI validation + image auto-detect ENABLED")
     app.run(debug=True, host='0.0.0.0', port=5000)
