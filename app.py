@@ -1,9 +1,9 @@
 """
 OOAD Diagram Validation Engine - Flask Backend
-OpenAI GPT-4o-mini Validation Engine
+Hybrid Validation: Gemini AI (primary) + Rule-Based (fallback)
 All 3 diagram types: class, usecase, sequence
 
-FIX: Image upload se diagram_type auto-detect via OpenAI Vision.
+FIX: Image upload se diagram_type auto-detect via Gemini Vision.
      Agar diagram_type missing/unknown ho toh image analyse karke
      automatically pata lagta hai ke class/usecase/sequence hai.
 
@@ -22,6 +22,9 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 from nlp_extractor import NLPExtractor
+from validators.class_validator import ClassDiagramValidator
+from validators.usecase_validator import UseCaseValidator
+from validators.sequence_validator import SequenceDiagramValidator
 from validators.openai_validator import validate_with_openai, validate_with_openai_image
 
 logging.basicConfig(level=logging.INFO)
@@ -143,9 +146,9 @@ def _normalize_dtype(raw: str) -> str:
 @app.route('/', methods=['GET'])
 def index():
     return jsonify({
-        "message": "OOAD Validation Engine",
+        "message": "OOAD Hybrid Validation Engine",
         "status":  "running",
-        "mode":    "OpenAI GPT-4o-mini",
+        "mode":    "OpenAI GPT-4o-mini (primary) + Rule-Based (fallback)",
         "features": {
             "image_auto_detect": "Upload image -> OpenAI Vision auto-detects diagram type",
             "diagram_types":     ["class", "usecase", "sequence"],
@@ -158,7 +161,7 @@ def index():
 def health():
     return jsonify({
         "status":         "ok",
-        "message":        "Validation Engine is running",
+        "message":        "Hybrid Validation Engine is running",
         "openai_enabled": bool(_get_api_key()),
     })
 
@@ -226,6 +229,15 @@ def validate():
                 )
             }), 400
 
+    # Select rule-based validator
+    if dtype == "usecase":
+        rule_validator = UseCaseValidator()
+    elif dtype == "sequence":
+        rule_validator = SequenceDiagramValidator()
+    else:
+        dtype = "class"
+        rule_validator = ClassDiagramValidator()
+
     # ── NLP extraction ─────────────────────────────────────────────────────
     extracted = extractor.extract(scenario)
 
@@ -248,11 +260,13 @@ def validate():
         gemini_result["validation_mode"] = "openai"
         final_result = gemini_result
     else:
-        _log.error("OpenAI validation unavailable for '%s' diagram", dtype)
-        return jsonify({
-            "error": "OpenAI validation is currently unavailable. Please try again.",
-            "diagram_type": dtype,
-        }), 503
+        # Fallback to rule-based
+        _log.warning("OpenAI unavailable - rule-based fallback for '%s'", dtype)
+        rule_result = rule_validator.validate(extracted, shapes)
+        rule_result["validation_mode"] = "rule-based (OpenAI unavailable)"
+        # Rule-based has no auto_fix — set fixable_count to 0
+        rule_result.setdefault("fixable_count", 0)
+        final_result = rule_result
 
     return jsonify({
         "diagram_type":        dtype,
@@ -276,7 +290,7 @@ def extract_only():
 if __name__ == '__main__':
     key = _get_api_key()
     if not key:
-        _log.warning("OPENAI_API_KEY not set - validation and image auto-detect DISABLED.")
+        _log.warning("OPENAI_API_KEY not set - rule-based only. Image auto-detect DISABLED.")
     else:
         _log.info("OpenAI API key found - AI validation + image auto-detect ENABLED")
     app.run(debug=True, host='0.0.0.0', port=5000)
