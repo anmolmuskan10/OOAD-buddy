@@ -6,7 +6,7 @@ OpenAI AI Validator for ALL diagram types:
   - Use Case Diagram
   - Sequence Diagram
 
-Model: gpt-4o
+Model: gpt-4o-2024-08-06 (pinned stable version)
 Rate limit (429): auto wait + retry
 
 FIX: Shape sanitizer added — strips ToolType. prefix, filters shapes by
@@ -27,6 +27,7 @@ from typing import List, Dict, Any, Optional
 _log = logging.getLogger(__name__)
 
 _MODELS = [
+    "gpt-4o-2024-08-06",
     "gpt-4o-mini",
 ]
 
@@ -1815,7 +1816,7 @@ def validate_with_openai_image(
         return None
 
     # Vision-capable models only
-    vision_models = ["gpt-4o-mini"]
+    vision_models = ["gpt-4o-2024-08-06", "gpt-4o-mini"]
 
     prompt = _build_image_prompt(diagram_type, scenario)
 
