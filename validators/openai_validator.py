@@ -435,46 +435,10 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
                         "auto_fix": {"fixable": True, "action": "rename_shape", "name": f"Manage {name}"},
                     })
 
-    # ── Connection checking: DISCONNECTED_ACTOR / ISOLATED_USE_CASE ──────────
-    # Flutter arrows use spatial positioning — from/to fields may be empty.
-    # We check using arrow shapes that DO have from/to populated.
-    # Build connection sets from arrows that have non-empty from/to.
-    connected_actors    = set()
-    connected_use_cases = set()
-
-    for s in shapes:
-        t = s.get("type", "")
-        if "arrow" in t or "line" in t or "association" in t:
-            frm = _n(str(s.get("from", "") or s.get("startShape", "") or ""))
-            to  = _n(str(s.get("to",   "") or s.get("endShape",   "") or ""))
-            if frm:
-                connected_actors.add(frm)
-                connected_use_cases.add(frm)
-            if to:
-                connected_actors.add(to)
-                connected_use_cases.add(to)
-
-    # DISCONNECTED_ACTOR: actor with no connection to any use case
-    for norm_name, orig_name in actors.items():
-        if norm_name not in connected_actors:
-            errors.append({
-                "error_type": "DISCONNECTED_ACTOR", "severity": "ERROR",
-                "element": orig_name,
-                "description": f"Actor '{orig_name}' is not connected to any use case.",
-                "suggestion": f"Draw an association line from '{orig_name}' to at least one use case.",
-                "auto_fix": {"fixable": False},
-            })
-
-    # ISOLATED_USE_CASE: use case with no connection to any actor
-    for norm_name, orig_name in use_cases.items():
-        if norm_name not in connected_use_cases:
-            errors.append({
-                "error_type": "ISOLATED_USE_CASE", "severity": "ERROR",
-                "element": orig_name,
-                "description": f"Use case '{orig_name}' is not connected to any actor.",
-                "suggestion": f"Connect '{orig_name}' to at least one actor.",
-                "auto_fix": {"fixable": False},
-            })
+    # NOTE: Connection checking (DISCONNECTED_ACTOR / ISOLATED_USE_CASE) is intentionally
+    # NOT done here. Flutter arrows use spatial positioning — their from/to fields are empty,
+    # so _build_connection_map() would always return an empty map and produce false positives.
+    # Spatial connection checking is handled correctly by usecase_validator.py (_line_touches()).
 
     # Check: actor names should be nouns (not start with a verb)
     _COMMON_VERBS_ACTOR = {
@@ -686,6 +650,7 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
     - ignored_errors: list of error fingerprints that user has dismissed — never re-report them.
     """
     SKIP_FROM_LLM = {
+        "disconnected_actor", "isolated_use_case",
         "wrong_class_capitalisation", "wrong_capitalisation",
         "wrong_actor_capitalisation", "wrong_use_case_capitalisation",
         "duplicate_actor", "duplicate_use_case", "duplicate_class",
@@ -696,8 +661,8 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
         "self_referential", "incorrect_self_reference",
         "incorrect_relationship", "incorrect_actor_relationship",
         "actor_self_relationship", "invalid_relationship",
-        # NOTE: wrong_multiplicity, disconnected_actor, isolated_use_case
-        # are now handled properly — NOT skipped.
+        # WRONG_MULTIPLICITY: LLM flip-flops between two valid values — skip entirely.
+        "wrong_multiplicity",
     }
 
     existing      = _existing_names(clean_shapes)
@@ -1041,13 +1006,9 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: Do NOT suggest a specific multiplicity value (like "1 to *") unless the scenario explicitly states it.
 
 ### WRONG_MULTIPLICITY:
-- Check EVERY association/aggregation/composition arrow that HAS multiplicity values.
-- Compare the drawn multiplicity against what the scenario describes.
-- If scenario says "one customer places many orders" → Customer end must be "1", Order end must be "*" or "1..*".
-- If drawn values do NOT match scenario intent → report WRONG_MULTIPLICITY as WARNING.
-- Provide correct expected values in auto_fix: multiplicity_from and multiplicity_to.
-- If scenario does NOT mention specific multiplicity values → do NOT report WRONG_MULTIPLICITY.
-- STRICT: Only report if you are CERTAIN the values are wrong based on clear scenario text.
+- STRICT: Do NOT report WRONG_MULTIPLICITY at all. This check is disabled.
+- STRICT: Even if multiplicity values seem incorrect, DO NOT report WRONG_MULTIPLICITY.
+- STRICT: Multiplicity correctness is validated separately — skip all WRONG_MULTIPLICITY checks entirely.
 
 ### MISSING_ATTRIBUTE / MISSING_METHOD:
 - STRICT: ONLY report MISSING_ATTRIBUTE if the scenario EXPLICITLY lists specific attributes for a class (e.g. "Customer has attributes: name, email, phone").
@@ -1058,12 +1019,8 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: Extra attributes/methods that are NOT in the scenario but user adds → NO error (user can add more than scenario requires).
 
 ### MISSING_ASSOCIATION_LABEL:
-- Check EVERY association/aggregation/composition arrow in the diagram.
-- If the scenario uses a VERB between two entities (e.g. "Bank manages Customer", "Teacher teaches Student") → that verb is the expected label.
-- If the drawn arrow has no relationship_label AND the scenario names one → report MISSING_ASSOCIATION_LABEL as WARNING.
-- element: "ClassA → ClassB", suggestion: "Add label 'X' to the arrow."
-- auto_fix: fixable: true, action: add_label, from_element, to_element, label: <verb from scenario>
-- STRICT: If scenario does NOT use a specific verb for the relationship → do NOT report missing label.
+- STRICT: Only report if scenario EXPLICITLY mentions what the relationship should be called (e.g. "Bank manages Customer" → label is "manages").
+- STRICT: If scenario does not name the relationship, do NOT report missing label.
 
 ### General:
 - STRICT: When in doubt about ANY error, SKIP it.
