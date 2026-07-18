@@ -4,14 +4,14 @@ Hybrid Validation: Gemini AI (primary) + Rule-Based (fallback)
 All 3 diagram types: class, usecase, sequence
 
 FIX: Image upload se diagram_type auto-detect via Gemini Vision.
-     Agar diagram_type missing/unknown ho toh image analyse karke 
+     Agar diagram_type missing/unknown ho toh image analyse karke
      automatically pata lagta hai ke class/usecase/sequence hai.
 
 UPDATE: gpt-4o -> gpt-4o-mini (rate limit fix), timeout 120s, retry logic added
 """
 
 import os
-import re 
+import re
 import json
 import base64
 import logging
@@ -129,99 +129,6 @@ Do not explain. Just the single word."""
 # ─────────────────────────────────────────────────────────────────────────────
 #  Normalize diagram_type string
 # ─────────────────────────────────────────────────────────────────────────────
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  MERGE FIX (2026-07): error types the OpenAI prompt explicitly tells the
-#  model to SKIP because "the rule system handles it" — but app.py never
-#  actually ran the rule system when OpenAI succeeded, so these were being
-#  silently dropped 100% of the time. This map lists, per diagram type,
-#  which error_types must ALWAYS be sourced from the rule-based validator,
-#  even when OpenAI is the primary engine.
-# ─────────────────────────────────────────────────────────────────────────────
-_RULE_ONLY_ERROR_TYPES = {
-    "class":    {"WRONG_MULTIPLICITY", "MISSING_MULTIPLICITY", "INVALID_MULTIPLICITY",
-                 "MISSING_ASSOCIATION_NAME"},
-    "usecase":  {
-        "DISCONNECTED_ACTOR", "ISOLATED_USE_CASE",
-        "DUPLICATE_ACTOR", "DUPLICATE_USE_CASE",
-        "UNLABELLED_ACTOR", "UNLABELLED_USE_CASE",
-        "USE_CASE_TOO_VAGUE",
-    },
-    "sequence": set(),
-}
-
-
-def _merge_rule_only_checks(final_result: dict, rule_validator, extracted: dict,
-                             shapes: list, dtype: str) -> dict:
-    """
-    Run the rule-based validator alongside an OpenAI result and merge in
-    ONLY the error types that OpenAI was told to skip. Requires shape/geometry
-    data to be meaningful (image-only requests have no shapes, so this is a
-    no-op there — those checks simply can't run without geometry).
-    """
-    wanted = _RULE_ONLY_ERROR_TYPES.get(dtype, set())
-    if not wanted or not shapes:
-        return final_result
-
-    try:
-        rule_result = rule_validator.validate(extracted, shapes)
-    except Exception as e:
-        _log.warning("Rule-only merge: rule_validator failed: %s", e)
-        return final_result
-
-    already_present = {
-        (str(i.get("error_type", "")), str(i.get("element", "")))
-        for bucket in ("errors", "warnings", "info")
-        for i in final_result.get(bucket, [])
-    }
-    # Multiplicity errors: also track by normalized (from,to) pair, since the
-    # LLM's `element` string and the rule engine's `element` string ("A → B")
-    # aren't formatted the same way and would otherwise both get kept.
-    _mult_types = {"MISSING_MULTIPLICITY", "WRONG_MULTIPLICITY", "INVALID_MULTIPLICITY"}
-    already_mult_pairs = set()
-    for bucket in ("errors", "warnings", "info"):
-        for i in final_result.get(bucket, []):
-            if i.get("error_type") in _mult_types:
-                fix = i.get("auto_fix") or {}
-                frm = str(fix.get("from_element", "")).strip().lower()
-                to  = str(fix.get("to_element", "")).strip().lower()
-                if frm and to:
-                    already_mult_pairs.add(frozenset({frm, to}))
-
-    added_any = False
-    for bucket in ("errors", "warnings", "info"):
-        for item in rule_result.get(bucket, []):
-            et = item.get("error_type")
-            if et not in wanted:
-                continue
-            key = (str(et), str(item.get("element", "")))
-            if key in already_present:
-                continue
-            if et in _mult_types:
-                elem = str(item.get("element", ""))
-                parts = [p.strip().lower() for p in elem.split("→")]
-                if len(parts) == 2 and frozenset(parts) in already_mult_pairs:
-                    continue
-            item.setdefault("source", "rule")
-            final_result.setdefault(bucket, []).append(item)
-            already_present.add(key)
-            added_any = True
-
-    if added_any:
-        final_result["is_valid"] = len(final_result.get("errors", [])) == 0
-        final_result["total_issues"] = (
-            len(final_result.get("errors", [])) +
-            len(final_result.get("warnings", [])) +
-            len(final_result.get("info", []))
-        )
-        final_result["fixable_count"] = sum(
-            1 for bucket in ("errors", "warnings", "info")
-            for i in final_result.get(bucket, [])
-            if i.get("auto_fix", {}).get("fixable")
-        )
-
-    return final_result
-
 
 def _normalize_dtype(raw: str) -> str:
     """'UseCase', 'use_case', 'CLASS' etc. -> 'class'/'usecase'/'sequence' or ''"""
@@ -352,14 +259,6 @@ def validate():
         _log.info("OpenAI validation used for '%s' diagram", dtype)
         gemini_result["validation_mode"] = "openai"
         final_result = gemini_result
-        # FIX: OpenAI's prompt explicitly skips certain error types (e.g.
-        # WRONG_MULTIPLICITY, DISCONNECTED_ACTOR, ISOLATED_USE_CASE...)
-        # assuming the rule-based validator reports them instead. Since the
-        # rule-based validator was never actually invoked in this branch,
-        # those checks were silently missing. Merge them back in here.
-        final_result = _merge_rule_only_checks(
-            final_result, rule_validator, extracted, shapes, dtype
-        )
     else:
         # Fallback to rule-based
         _log.warning("OpenAI unavailable - rule-based fallback for '%s'", dtype)
