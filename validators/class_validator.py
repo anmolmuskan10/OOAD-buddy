@@ -1646,6 +1646,24 @@ class ClassDiagramValidator(BaseValidator):
                         severity    = ValidationError.SEVERITY_ERROR,
                         element     = f"{frm_disp} → {to_disp}",
                     ))
+
+                # ═════════════════════════════════════════════════════════════
+                #  NEW RULE — Association Name is required (unconditional).
+                #  Every association/aggregation/composition line must have a
+                #  label at its midpoint, regardless of whether the scenario
+                #  names one. This is intentionally separate from
+                #  MISSING_ASSOCIATION_LABEL above, which only fires when the
+                #  scenario explicitly names the expected label — this check
+                #  fires whenever the line has NO name at all.
+                # ═════════════════════════════════════════════════════════════
+                if not str(rel.get("label", "")).strip():
+                    errors.append(ValidationError(
+                        error_type  = "MISSING_ASSOCIATION_NAME",
+                        description = "Association Name is required",
+                        suggestion  = f"Add a name label at the midpoint of the line between '{frm_disp}' and '{to_disp}'.",
+                        severity    = ValidationError.SEVERITY_ERROR,
+                        element     = f"{frm_disp} → {to_disp}",
+                    ))
         #  Only triggered when scenario itself defines expected relationships
         # ═════════════════════════════════════════════════════════════════════
         if scenario_has_relationships and relationships:
