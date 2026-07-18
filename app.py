@@ -4,7 +4,7 @@ Hybrid Validation: Gemini AI (primary) + Rule-Based (fallback)
 All 3 diagram types: class, usecase, sequence
 
 FIX: Image upload se diagram_type auto-detect via Gemini Vision.
-     Agar diagram_type missing/unknown ho toh image analyse karke
+     Agar diagram_type missing/unknown ho toh image analyse karke 
      automatically pata lagta hai ke class/usecase/sequence hai.
 
 UPDATE: gpt-4o -> gpt-4o-mini (rate limit fix), timeout 120s, retry logic added
