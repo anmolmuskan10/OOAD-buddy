@@ -139,7 +139,8 @@ Do not explain. Just the single word."""
 #  even when OpenAI is the primary engine.
 # ─────────────────────────────────────────────────────────────────────────────
 _RULE_ONLY_ERROR_TYPES = {
-    "class":    {"WRONG_MULTIPLICITY", "MISSING_MULTIPLICITY", "INVALID_MULTIPLICITY"},
+    "class":    {"WRONG_MULTIPLICITY", "MISSING_MULTIPLICITY", "INVALID_MULTIPLICITY",
+                 "MISSING_ASSOCIATION_NAME"},
     "usecase":  {
         "DISCONNECTED_ACTOR", "ISOLATED_USE_CASE",
         "DUPLICATE_ACTOR", "DUPLICATE_USE_CASE",
