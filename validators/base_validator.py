@@ -30,13 +30,15 @@ class ValidationError:
         severity:    str = "ERROR",
         element:     str = "",
         source:      str = SOURCE_RULE,   # NEW: tag which engine found this
+        auto_fix:    Dict[str, Any] = None,  # NEW: optional fix payload
     ):
         self.error_type  = error_type
         self.description = description
         self.suggestion  = suggestion
-        self.severity    = severity
+        self.severity     = severity
         self.element     = element
         self.source      = source
+        self.auto_fix    = auto_fix if auto_fix is not None else {"fixable": False}
 
     def to_dict(self) -> Dict[str, str]:
         return {
@@ -46,6 +48,7 @@ class ValidationError:
             "description": self.description,
             "suggestion":  self.suggestion,
             "source":      self.source,
+            "auto_fix":    self.auto_fix,
         }
 
 
