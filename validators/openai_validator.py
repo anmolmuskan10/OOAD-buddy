@@ -39,7 +39,7 @@ _SYSTEM_MESSAGE = (
     "You are a strict, deterministic UML diagram validator. "
     "ALL name matching is CASE-INSENSITIVE — 'login' and 'Login' are identical. "
     "NEVER report missing/extra elements due to capitalisation differences. "
-    "NEVER report DISCONNECTED_ACTOR or ISOLATED_USE_CASE — connection checking is done separately. "
+    "DISCONNECTED_ACTOR and ISOLATED_USE_CASE are checked by rule engine — do NOT duplicate them. "
     "Only report scenario-based structural errors you are 100% certain about. "
     "Return valid JSON only — no markdown, no prose."
 )
@@ -435,10 +435,38 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
                         "auto_fix": {"fixable": True, "action": "rename_shape", "name": f"Manage {name}"},
                     })
 
-    # NOTE: Connection checking (DISCONNECTED_ACTOR / ISOLATED_USE_CASE) is intentionally
-    # NOT done here. Flutter arrows use spatial positioning — their from/to fields are empty,
-    # so _build_connection_map() would always return an empty map and produce false positives.
-    # Spatial connection checking is handled correctly by usecase_validator.py (_line_touches()).
+    # ── Connection checking ─────────────────────────────────────────────────
+    # Build connected sets from arrow shapes that have non-empty from/to fields.
+    connected = set()
+    for s in shapes:
+        t = s.get("type", "")
+        if any(k in t for k in ("arrow", "line", "association", "connector")):
+            for key in ("from", "to", "startShape", "endShape", "source", "target"):
+                val = _n(str(s.get(key) or ""))
+                if val:
+                    connected.add(val)
+
+    # DISCONNECTED_ACTOR: actor with no arrow connecting to any use case
+    for norm_name, orig_name in actors.items():
+        if norm_name not in connected:
+            errors.append({
+                "error_type": "DISCONNECTED_ACTOR", "severity": "ERROR",
+                "element": orig_name,
+                "description": f"Actor '{orig_name}' is not connected to any use case.",
+                "suggestion": f"Draw an association line from '{orig_name}' to at least one use case.",
+                "auto_fix": {"fixable": False},
+            })
+
+    # ISOLATED_USE_CASE: use case oval with no arrow connecting to any actor
+    for norm_name, orig_name in use_cases.items():
+        if norm_name not in connected:
+            errors.append({
+                "error_type": "ISOLATED_USE_CASE", "severity": "ERROR",
+                "element": orig_name,
+                "description": f"Use case '{orig_name}' is not connected to any actor.",
+                "suggestion": f"Connect '{orig_name}' to at least one actor.",
+                "auto_fix": {"fixable": False},
+            })
 
     # Check: actor names should be nouns (not start with a verb)
     _COMMON_VERBS_ACTOR = {
@@ -650,19 +678,18 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
     - ignored_errors: list of error fingerprints that user has dismissed — never re-report them.
     """
     SKIP_FROM_LLM = {
-        "disconnected_actor", "isolated_use_case",
         "wrong_class_capitalisation", "wrong_capitalisation",
         "wrong_actor_capitalisation", "wrong_use_case_capitalisation",
         "duplicate_actor", "duplicate_use_case", "duplicate_class",
         "unlabelled_actor", "unlabelled_use_case", "unlabelled_lifeline",
         "empty_class_name",
+        "disconnected_actor", "isolated_use_case",  # handled by rule engine above
         # Self-referential / actor-connection hallucinations
         "self_referential_relationship", "incorrect_self_referential_relationship",
         "self_referential", "incorrect_self_reference",
         "incorrect_relationship", "incorrect_actor_relationship",
         "actor_self_relationship", "invalid_relationship",
-        # WRONG_MULTIPLICITY: LLM flip-flops between two valid values — skip entirely.
-        "wrong_multiplicity",
+        # wrong_multiplicity is now ENABLED — removed from skip list
     }
 
     existing      = _existing_names(clean_shapes)
@@ -1006,9 +1033,13 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: Do NOT suggest a specific multiplicity value (like "1 to *") unless the scenario explicitly states it.
 
 ### WRONG_MULTIPLICITY:
-- STRICT: Do NOT report WRONG_MULTIPLICITY at all. This check is disabled.
-- STRICT: Even if multiplicity values seem incorrect, DO NOT report WRONG_MULTIPLICITY.
-- STRICT: Multiplicity correctness is validated separately — skip all WRONG_MULTIPLICITY checks entirely.
+- Check EVERY association, aggregation, and composition arrow that has multiplicity values set.
+- Compare drawn multiplicity against what the scenario describes.
+- Example: scenario says "one customer places many orders" → Customer end = "1", Order end = "*" or "1..*".
+- If drawn multiplicity values do NOT match scenario intent → report WRONG_MULTIPLICITY as WARNING.
+- Provide correct values in auto_fix: multiplicity_from and multiplicity_to.
+- STRICT: Only report if scenario EXPLICITLY states the relationship cardinality.
+- STRICT: If scenario does not mention specific multiplicity → do NOT report WRONG_MULTIPLICITY.
 
 ### MISSING_ATTRIBUTE / MISSING_METHOD:
 - STRICT: ONLY report MISSING_ATTRIBUTE if the scenario EXPLICITLY lists specific attributes for a class (e.g. "Customer has attributes: name, email, phone").
@@ -1019,8 +1050,18 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: Extra attributes/methods that are NOT in the scenario but user adds → NO error (user can add more than scenario requires).
 
 ### MISSING_ASSOCIATION_LABEL:
-- STRICT: Only report if scenario EXPLICITLY mentions what the relationship should be called (e.g. "Bank manages Customer" → label is "manages").
-- STRICT: If scenario does not name the relationship, do NOT report missing label.
+- Check EVERY association, aggregation, and composition arrow.
+- If the scenario uses a verb between two entities (e.g. "Bank manages Customer" → label "manages"; "Teacher teaches Student" → label "teaches") and the drawn arrow has NO relationship_label → report MISSING_ASSOCIATION_LABEL as WARNING.
+- element: "ClassA → ClassB", suggestion: "Add label 'verb' to the arrow."
+- auto_fix: fixable: true, action: add_label, from_element, to_element, label: <verb from scenario>
+- STRICT: Only report if scenario EXPLICITLY names the relationship with a verb.
+- STRICT: If scenario does NOT name the relationship → do NOT report missing label.
+
+### WRONG_ASSOCIATION_LABEL:
+- If an arrow HAS a label but the label does NOT match what the scenario describes → report WRONG_ASSOCIATION_LABEL as WARNING.
+- Example: scenario says "manages" but arrow says "contains" → WRONG_ASSOCIATION_LABEL.
+- auto_fix: fixable: true, action: add_label, from_element, to_element, label: <correct label from scenario>
+- STRICT: Only report if scenario explicitly names the label AND the drawn label is clearly different.
 
 ### General:
 - STRICT: When in doubt about ANY error, SKIP it.
@@ -1063,6 +1104,13 @@ checking is done by a separate rule-based system — do NOT repeat those checks.
 DO NOT CHECK AND DO NOT REPORT:
 - DISCONNECTED_ACTOR (handled by rule system)
 - ISOLATED_USE_CASE (handled by rule system)
+- UNLABELLED_USE_CASE (handled by rule system)
+
+### MISSING_NOUN (actor name should be a noun/role):
+- Check EVERY actor name. Actors must represent roles or entities (nouns), NOT actions.
+- If an actor name starts with a verb (e.g. "Login", "Register", "Manage") → report MISSING_NOUN as WARNING.
+- suggestion: "Actor names should be roles/entities like 'Customer', 'Admin', 'System'."
+- auto_fix: fixable: false
 - DUPLICATE_ACTOR / DUPLICATE_USE_CASE (handled by rule system)
 - UNLABELLED_ACTOR / UNLABELLED_USE_CASE (handled by rule system)
 - Any capitalisation errors — case differences are NEVER errors
