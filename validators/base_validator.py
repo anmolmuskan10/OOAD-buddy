@@ -1,6 +1,6 @@
 """
 validators/base_validator.py
-─────────────────────────────
+───────────────────────────── 
 Har validator is base class ko inherit karta hai.
 Common helper methods yahan hain.
 
