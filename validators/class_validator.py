@@ -1563,6 +1563,55 @@ class ClassDiagramValidator(BaseValidator):
                     _skip_mult_pairs.add((_rf, _rt))
                     _skip_mult_pairs.add((_rt, _rf))
 
+        # ═════════════════════════════════════════════════════════════════
+        #  Best-effort scenario-based multiplicity / label guessing.
+        #  Conservative: only returns a guess when the scenario gives an
+        #  explicit cardinality/verb cue near both class names — otherwise
+        #  returns generic placeholders so we never invent facts.
+        # ═════════════════════════════════════════════════════════════════
+        _scenario_text_for_guess = extracted.get("scenario", extracted.get("raw_text", "")) or ""
+
+        def _guess_multiplicity_from_scenario(frm: str, to: str) -> tuple:
+            """Returns (from_mult, to_mult, confident: bool)."""
+            text = _scenario_text_for_guess.lower()
+            frm_l, to_l = frm.lower(), to.lower()
+            import re as _re_mult
+            for sent in _re_mult.split(r'(?<=[.!?])\s+', text):
+                if frm_l in sent and to_l in sent:
+                    many_words = ("many", "multiple", "several", "various")
+                    one_words  = ("one ", "a single", "each ", "single ")
+                    # crude ordering: whichever noun a "many"-word appears closer
+                    # to on the same side is treated as the "*" end.
+                    frm_idx = sent.find(frm_l)
+                    to_idx  = sent.find(to_l)
+                    frm_many = any(w in sent[:max(frm_idx, 0)+len(frm_l)+15] for w in many_words)
+                    to_many  = any(w in sent[max(to_idx-15, 0):to_idx+len(to_l)] for w in many_words)
+                    if frm_many and not to_many:
+                        return ("*", "1", True)
+                    if to_many and not frm_many:
+                        return ("1", "*", True)
+                    if any(w in sent for w in one_words) and any(w in sent for w in many_words):
+                        return ("1", "*", True)
+            return ("1", "*", False)  # safe generic default, not confident
+
+        def _guess_relationship_label_from_scenario(frm: str, to: str) -> str:
+            """Best-effort verb-based label guess, reusing the same verb list
+            used elsewhere for MISSING_ASSOCIATION_LABEL."""
+            text = _scenario_text_for_guess.lower()
+            frm_l, to_l = frm.lower(), to.lower()
+            _verbs = ("manages", "holds", "owns", "provides", "maintains", "employs",
+                      "handles", "processes", "serves", "assigns", "registers",
+                      "tracks", "records", "stores", "issues", "generates",
+                      "creates", "enrolls", "supervises", "coordinates", "schedules",
+                      "contains", "has")
+            import re as _re_lbl
+            for sent in _re_lbl.split(r'(?<=[.!?])\s+', text):
+                if frm_l in sent and to_l in sent:
+                    for v in _verbs:
+                        if f" {v} " in f" {sent} ":
+                            return v
+            return ""
+
         if relationships:
             for rel in relationships:
                 # ── Skip relationship types that never carry multiplicity ──────
@@ -1623,47 +1672,88 @@ class ClassDiagramValidator(BaseValidator):
                 mult_from = rel.get("multiplicity_from", "").strip()
                 mult_to   = rel.get("multiplicity_to",   "").strip()
                 if not mult_from and not mult_to:
+                    _gf, _gt, _confident = _guess_multiplicity_from_scenario(frm_disp, to_disp)
+                    _hint = (f" Based on the scenario, this looks like '{_gf}' on the '{frm_disp}' "
+                             f"side and '{_gt}' on the '{to_disp}' side."
+                             if _confident else
+                             f" Suggested values: '{_gf}' on '{frm_disp}', '{_gt}' on '{to_disp}' "
+                             f"— adjust to match your scenario.")
                     errors.append(ValidationError(
                         error_type  = "MISSING_MULTIPLICITY",
                         description = f"Relationship '{frm_disp}' → '{to_disp}' is missing multiplicity on both ends.",
-                        suggestion  = "Add multiplicity labels (e.g., '1', '0..*', '1..*') on both sides of the relationship.",
+                        suggestion  = ("Add multiplicity labels (e.g., '1', '0..*', '1..*') on both "
+                                       "sides of the relationship." + _hint),
                         severity    = ValidationError.SEVERITY_ERROR,
                         element     = f"{frm_disp} → {to_disp}",
+                        auto_fix    = {"fixable": True, "action": "add_label",
+                                       "from_element": frm_disp, "to_element": to_disp,
+                                       "multiplicity_from": _gf, "multiplicity_to": _gt},
                     ))
                 elif not mult_from:
+                    _gf, _gt, _confident = _guess_multiplicity_from_scenario(frm_disp, to_disp)
+                    _hint = f" Suggested: '{_gf}' on the '{frm_disp}' side." if _gf else ""
                     errors.append(ValidationError(
                         error_type  = "MISSING_MULTIPLICITY",
                         description = f"Relationship '{frm_disp}' → '{to_disp}' is missing multiplicity on the '{frm_disp}' side.",
-                        suggestion  = f"Add a multiplicity label (e.g., '1', '0..*') on the '{frm_disp}' side.",
+                        suggestion  = (f"Add a multiplicity label (e.g., '1', '0..*') on the "
+                                       f"'{frm_disp}' side." + _hint),
                         severity    = ValidationError.SEVERITY_ERROR,
                         element     = f"{frm_disp} → {to_disp}",
+                        auto_fix    = {"fixable": True, "action": "add_label",
+                                       "from_element": frm_disp, "to_element": to_disp,
+                                       "multiplicity_from": _gf, "multiplicity_to": mult_to},
                     ))
                 elif not mult_to:
+                    _gf, _gt, _confident = _guess_multiplicity_from_scenario(frm_disp, to_disp)
+                    _hint = f" Suggested: '{_gt}' on the '{to_disp}' side." if _gt else ""
                     errors.append(ValidationError(
                         error_type  = "MISSING_MULTIPLICITY",
                         description = f"Relationship '{frm_disp}' → '{to_disp}' is missing multiplicity on the '{to_disp}' side.",
-                        suggestion  = f"Add a multiplicity label (e.g., '1', '0..*') on the '{to_disp}' side.",
+                        suggestion  = (f"Add a multiplicity label (e.g., '1', '0..*') on the "
+                                       f"'{to_disp}' side." + _hint),
                         severity    = ValidationError.SEVERITY_ERROR,
                         element     = f"{frm_disp} → {to_disp}",
+                        auto_fix    = {"fixable": True, "action": "add_label",
+                                       "from_element": frm_disp, "to_element": to_disp,
+                                       "multiplicity_from": mult_from, "multiplicity_to": _gt},
                     ))
 
-                # ═════════════════════════════════════════════════════════════
-                #  NEW RULE — Association Name is required (unconditional).
-                #  Every association/aggregation/composition line must have a
-                #  label at its midpoint, regardless of whether the scenario
-                #  names one. This is intentionally separate from
-                #  MISSING_ASSOCIATION_LABEL above, which only fires when the
-                #  scenario explicitly names the expected label — this check
-                #  fires whenever the line has NO name at all.
-                # ═════════════════════════════════════════════════════════════
-                if not str(rel.get("label", "")).strip():
-                    errors.append(ValidationError(
-                        error_type  = "MISSING_ASSOCIATION_NAME",
-                        description = "Association Name is required",
-                        suggestion  = f"Add a name label at the midpoint of the line between '{frm_disp}' and '{to_disp}'.",
-                        severity    = ValidationError.SEVERITY_ERROR,
-                        element     = f"{frm_disp} → {to_disp}",
-                    ))
+        # ═════════════════════════════════════════════════════════════════
+        #  NEW RULE — Association Name is required (unconditional).
+        #  Every association/aggregation/composition line must have a label
+        #  at its midpoint, regardless of whether the scenario names one or
+        #  whether multiplicity applies. Runs in its own loop (NOT gated by
+        #  _needs_multiplicity) so it fires even for pairs where multiplicity
+        #  requirement couldn't be determined — this is intentionally
+        #  separate from MISSING_ASSOCIATION_LABEL above, which only fires
+        #  when the scenario explicitly names the expected label.
+        # ═════════════════════════════════════════════════════════════════
+        if relationships:
+            for rel in relationships:
+                rtype_chk = rel.get("type", "").lower().strip()
+                if any(k in rtype_chk for k in NO_MULTIPLICITY_TYPES):
+                    continue  # generalization/dependency/etc. never carry a name label
+                if str(rel.get("label", "")).strip():
+                    continue  # label present — fine
+
+                frm_disp = _display_name(rel.get("from", ""))
+                to_disp  = _display_name(rel.get("to", ""))
+                _guess_lbl = _guess_relationship_label_from_scenario(frm_disp, to_disp)
+                _suggestion = (
+                    f"Add a name label at the midpoint of the line between "
+                    f"'{frm_disp}' and '{to_disp}'"
+                    + (f" — the scenario suggests '{_guess_lbl}'." if _guess_lbl else ".")
+                )
+                errors.append(ValidationError(
+                    error_type  = "MISSING_ASSOCIATION_NAME",
+                    description = "Association Name is required",
+                    suggestion  = _suggestion,
+                    severity    = ValidationError.SEVERITY_ERROR,
+                    element     = f"{frm_disp} → {to_disp}",
+                    auto_fix    = {"fixable": bool(_guess_lbl), "action": "add_label",
+                                   "from_element": frm_disp, "to_element": to_disp,
+                                   "name": _guess_lbl},
+                ))
         #  Only triggered when scenario itself defines expected relationships
         # ═════════════════════════════════════════════════════════════════════
         if scenario_has_relationships and relationships:
