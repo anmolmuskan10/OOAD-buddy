@@ -503,7 +503,7 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
                 _pos = _pos_analyze(name)
                 if _pos["has_verb"] and not _pos["has_noun"]:
                     errors.append({
-                        "error_type": "MISSING_NOUN", "severity": "WARNING",
+                        "error_type": "MISSING_NOUN", "severity": "ERROR",
                         "element": name,
                         "description": f"Use case '{name}' has a verb but no noun/object — it's too vague.",
                         "suggestion": f"Add an object to '{name}', e.g. '{name} Order' or '{name} Account'.",
@@ -511,7 +511,7 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
                     })
                 elif _pos["has_noun"] and not _pos["has_verb"]:
                     errors.append({
-                        "error_type": "MISSING_VERB_IN_USE_CASE", "severity": "WARNING",
+                        "error_type": "MISSING_VERB_IN_USE_CASE", "severity": "ERROR",
                         "element": name,
                         "description": f"Use case '{name}' does not contain an action verb.",
                         "suggestion": f"Rename '{name}' to start with a verb, e.g. 'Manage {name}' or 'Process {name}'.",
@@ -519,7 +519,7 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
                     })
                 elif not _pos["has_verb"] and not _pos["has_noun"]:
                     errors.append({
-                        "error_type": "MISSING_VERB_IN_USE_CASE", "severity": "WARNING",
+                        "error_type": "MISSING_VERB_IN_USE_CASE", "severity": "ERROR",
                         "element": name,
                         "description": f"Use case '{name}' name is unclear — it should contain both an action verb and a noun.",
                         "suggestion": f"Rename '{name}' to something like 'Manage {name}'.",
@@ -589,7 +589,49 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
     return errors
 
 
-def _rule_check_class(shapes: List[Dict]) -> List[Dict]:
+_RELATIONSHIP_VERBS = (
+    "manages", "holds", "owns", "provides", "maintains", "employs",
+    "handles", "processes", "serves", "assigns", "registers",
+    "tracks", "records", "stores", "issues", "generates",
+    "creates", "enrolls", "supervises", "coordinates", "schedules",
+    "contains", "has", "places", "makes", "includes", "belongs",
+)
+
+
+def _guess_association_label(scenario: str, frm: str, to: str) -> str:
+    """Best-effort verb-based label guess from the scenario text. Returns ''
+    if no confident guess can be made — we never invent a label."""
+    if not scenario or not frm or not to:
+        return ""
+    text = scenario.lower()
+    frm_l, to_l = frm.lower(), to.lower()
+    for sent in re.split(r'(?<=[.!?])\s+', text):
+        if frm_l in sent and to_l in sent:
+            for v in _RELATIONSHIP_VERBS:
+                if f" {v} " in f" {sent} ":
+                    return v
+    return ""
+
+
+def _class_mentioned_in_scenario(scenario: str, class_name: str) -> bool:
+    """Loose check: is this class name (or a close variant) present anywhere
+    in the scenario text? Case-insensitive, tolerates plural 's'."""
+    if not scenario or not class_name:
+        return True  # no scenario to check against — don't flag
+    text = scenario.lower()
+    name = class_name.lower().strip()
+    if not name:
+        return True
+    if name in text or name.rstrip("s") in text:
+        return True
+    # Also try matching individual words for multi-word class names
+    words = [w for w in name.split() if len(w) > 2]
+    if words and all(w in text or w.rstrip("s") in text for w in words):
+        return True
+    return False
+
+
+def _rule_check_class(shapes: List[Dict], scenario: str = "") -> List[Dict]:
     """Deterministic rule checks for class diagrams."""
     errors = []
     class_names = {}  # norm -> original
@@ -627,6 +669,20 @@ def _rule_check_class(shapes: List[Dict]) -> List[Dict]:
                     "suggestion": f"Rename '{name}' to '{correct}'.",
                     "auto_fix": {"fixable": True, "action": "rename_shape", "name": correct},
                 })
+    # ── Class-not-in-scenario check ──────────────────────────────────────────
+    # A class drawn in the diagram that the scenario never mentions at all.
+    # Runs independently of duplicate/capitalisation checks above.
+    if scenario:
+        for n, orig in class_names.items():
+            if not _class_mentioned_in_scenario(scenario, orig):
+                errors.append({
+                    "error_type": "CLASS_NOT_IN_SCENARIO", "severity": "ERROR",
+                    "element": orig,
+                    "description": f"Class '{orig}' is not mentioned anywhere in the scenario.",
+                    "suggestion": f"Remove '{orig}' if it's not needed, or update the scenario to include it.",
+                    "auto_fix": {"fixable": False},
+                })
+
     # ── Multiplicity + Association-Name checks (previously missing entirely) ──
     # Every association/aggregation/composition arrow must have valid
     # multiplicity on BOTH ends and a name label at its midpoint.
@@ -712,12 +768,20 @@ def _rule_check_class(shapes: List[Dict]) -> List[Dict]:
                 if len(parts) >= 2:
                     label = parts[1].strip()
         if not label:
+            _guess = _guess_association_label(scenario, frm_disp, to_disp)
+            _suggestion = (
+                f"Add a name label at the midpoint of the line between "
+                f"'{frm_disp}' and '{to_disp}'"
+                + (f" — based on the scenario, this looks like '{_guess}'." if _guess else ".")
+            )
             errors.append({
                 "error_type": "MISSING_ASSOCIATION_NAME", "severity": "ERROR",
                 "element": f"{frm_disp} \u2192 {to_disp}",
                 "description": "Association Name is required",
-                "suggestion": f"Add a name label at the midpoint of the line between '{frm_disp}' and '{to_disp}'.",
-                "auto_fix": {"fixable": False},
+                "suggestion": _suggestion,
+                "auto_fix": {"fixable": bool(_guess), "action": "add_label",
+                             "from_element": frm_disp, "to_element": to_disp,
+                             "label": _guess},
             })
 
     return errors
@@ -768,12 +832,12 @@ def _rule_check_sequence(shapes: List[Dict]) -> List[Dict]:
     return errors
 
 
-def _run_rule_checks(shapes: List[Dict], diagram_type: str) -> List[Dict]:
+def _run_rule_checks(shapes: List[Dict], diagram_type: str, scenario: str = "") -> List[Dict]:
     dt = diagram_type.lower()
     if "usecase" in dt or "use_case" in dt or "use case" in dt:
         return _rule_check_usecase(shapes)
     elif "class" in dt:
-        return _rule_check_class(shapes)
+        return _rule_check_class(shapes, scenario)
     elif "sequence" in dt:
         return _rule_check_sequence(shapes)
     return []
@@ -874,6 +938,7 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
         "missing_multiplicity", "invalid_multiplicity",  # handled by rule engine above
         "missing_association_name",  # handled by rule engine above
         "missing_noun",  # handled by rule engine above
+        "class_not_in_scenario",  # handled by rule engine above
         # Self-referential / actor-connection hallucinations
         "self_referential_relationship", "incorrect_self_referential_relationship",
         "self_referential", "incorrect_self_reference",
@@ -1746,7 +1811,7 @@ def validate_with_openai(
     _log.info("Sanitized shapes: %d → %d (diagram: %s)", len(shapes), len(clean_shapes), diagram_type)
 
     # Step 2 — Run deterministic rule-based checks (connections, duplicates, empty names)
-    rule_errors = _run_rule_checks(clean_shapes, diagram_type)
+    rule_errors = _run_rule_checks(clean_shapes, diagram_type, scenario)
     _log.info("Rule checks: %d issues found", len(rule_errors))
 
     # Step 3 — Ask LLM only for scenario-semantic checks
