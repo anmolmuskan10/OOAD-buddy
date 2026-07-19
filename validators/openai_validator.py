@@ -589,6 +589,26 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
     return errors
 
 
+_MODALS = ("can", "could", "will", "would", "shall", "should", "may", "might", "must")
+
+# Generic/vague verbs — deprioritized when a more specific verb is also found
+# in the same sentence (rule: "agar 2 verbs hon to zyada specific wala lo").
+_GENERIC_VERBS = {"is", "are", "was", "were", "has", "have", "had"}
+
+# Explicit phrase → label mappings, checked before generic verb extraction.
+# Longest/most-specific phrases first so e.g. "has a" wins over bare "has".
+_EXPLICIT_PHRASES = (
+    (r"\bis placed by\b",  "placed by"),
+    (r"\bplaced by\b",     "placed by"),
+    (r"\bworks for\b",     "works for"),
+    (r"\breports to\b",    "reports to"),
+    (r"\bbelongs to\b",    "belongs to"),
+    (r"\bis a\b",          "is a"),
+    (r"\bis an\b",         "is a"),
+    (r"\bhas a\b",         "has"),
+    (r"\bhas an\b",        "has"),
+)
+
 _RELATIONSHIP_VERBS = (
     "manages", "holds", "owns", "provides", "maintains", "employs",
     "handles", "processes", "serves", "assigns", "registers",
@@ -598,18 +618,94 @@ _RELATIONSHIP_VERBS = (
 )
 
 
+def _to_present_tense(verb: str) -> str:
+    """Crude 3rd-person-singular present-tense conjugation of a verb lemma.
+    'place' -> 'places', 'try' -> 'tries', 'watch' -> 'watches'."""
+    v = verb.lower().strip()
+    if not v:
+        return v
+    if v.endswith("y") and len(v) > 1 and v[-2] not in "aeiou":
+        return v[:-1] + "ies"
+    if v.endswith(("s", "x", "z", "ch", "sh")):
+        return v + "es"
+    if v.endswith("e"):
+        return v + "s"
+    return v + "s"
+
+
+def _extract_modal_verb(segment: str) -> str:
+    """'can place' -> 'places', 'will manage' -> 'manages'. Returns '' if no
+    modal+verb pattern is found."""
+    words = segment.split()
+    for i, w in enumerate(words):
+        if w in _MODALS and i + 1 < len(words):
+            nxt = re.sub(r"[^a-z]", "", words[i + 1])
+            if nxt:
+                return _to_present_tense(nxt)
+    return ""
+
+
 def _guess_association_label(scenario: str, frm: str, to: str) -> str:
-    """Best-effort verb-based label guess from the scenario text. Returns ''
-    if no confident guess can be made — we never invent a label."""
+    """
+    Best-effort verb-phrase extraction from the scenario text, following:
+      1. Identify the verb/verb-phrase connecting the two class names.
+      2. Present tense, lowercase (modal phrases like "can place" -> "places").
+      3. Explicit phrases ("has a", "is a", "works for", "placed by") are
+         used directly as the label.
+      4. If two verb candidates are found in the same sentence, prefer the
+         more specific one (generic "has"/"is" lose to a specific verb).
+    Returns '' if no confident guess can be made — we never invent a label.
+    """
     if not scenario or not frm or not to:
         return ""
-    text = scenario.lower()
     frm_l, to_l = frm.lower(), to.lower()
-    for sent in re.split(r'(?<=[.!?])\s+', text):
-        if frm_l in sent and to_l in sent:
-            for v in _RELATIONSHIP_VERBS:
-                if f" {v} " in f" {sent} ":
-                    return v
+
+    for sent in re.split(r'(?<=[.!?])\s+', scenario.lower()):
+        i_frm, i_to = sent.find(frm_l), sent.find(to_l)
+        if i_frm == -1 or i_to == -1:
+            continue
+
+        # Text strictly between the two class-name mentions carries the verb.
+        if i_frm < i_to:
+            between = sent[i_frm + len(frm_l): i_to]
+        else:
+            between = sent[i_to + len(to_l): i_frm]
+        between = between.strip()
+
+        candidates = []
+
+        # 1. Explicit copula/passive phrases (checked first, most reliable).
+        for pat, lbl in _EXPLICIT_PHRASES:
+            if re.search(pat, between):
+                candidates.append(lbl)
+
+        # 2. Modal + verb ("can place" -> "places").
+        modal_verb = _extract_modal_verb(between)
+        if modal_verb:
+            candidates.append(modal_verb)
+
+        # 3. Known relationship verbs appearing in the sentence.
+        for v in _RELATIONSHIP_VERBS:
+            if re.search(rf"\b{v}\b", between) or re.search(rf"\b{v}\b", sent):
+                candidates.append(v)
+
+        # 4. spaCy fallback — lemmatize the main verb and conjugate it,
+        #    so verbs outside the fixed list are still caught.
+        nlp = _get_pos_model()
+        if nlp is not None and between.strip():
+            doc = nlp(between)
+            for t in doc:
+                if t.pos_ == "VERB":
+                    candidates.append(_to_present_tense(t.lemma_))
+                    break
+
+        if not candidates:
+            continue
+
+        # Prefer the more specific (non-generic) verb when more than one found.
+        specific = [c for c in candidates if c not in _GENERIC_VERBS]
+        return specific[0] if specific else candidates[0]
+
     return ""
 
 
@@ -624,7 +720,6 @@ def _class_mentioned_in_scenario(scenario: str, class_name: str) -> bool:
         return True
     if name in text or name.rstrip("s") in text:
         return True
-    # Also try matching individual words for multi-word class names
     words = [w for w in name.split() if len(w) > 2]
     if words and all(w in text or w.rstrip("s") in text for w in words):
         return True
@@ -670,8 +765,6 @@ def _rule_check_class(shapes: List[Dict], scenario: str = "") -> List[Dict]:
                     "auto_fix": {"fixable": True, "action": "rename_shape", "name": correct},
                 })
     # ── Class-not-in-scenario check ──────────────────────────────────────────
-    # A class drawn in the diagram that the scenario never mentions at all.
-    # Runs independently of duplicate/capitalisation checks above.
     if scenario:
         for n, orig in class_names.items():
             if not _class_mentioned_in_scenario(scenario, orig):
