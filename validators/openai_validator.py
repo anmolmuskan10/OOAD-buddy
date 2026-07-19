@@ -19,6 +19,7 @@ import os
 import json
 import logging
 import re
+import math
 import time
 import urllib.request
 import urllib.error
@@ -145,7 +146,12 @@ def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
         for field in ("text", "label", "name", "id", "from", "to",
                       "startLifeline", "endLifeline", "lifelineRef",
                       "multiplicity_start", "multiplicity_end",
-                      "relationship_label", "attributes", "methods"):
+                      "relationship_label", "attributes", "methods",
+                      # position/geometry — needed so auto_fix can target the
+                      # exact shape/line instead of the frontend creating a
+                      # new one with no idea where it belongs.
+                      "position", "endPosition", "size", "x", "y",
+                      "width", "height"):
             val = s.get(field)
             if val is not None and str(val).strip().lower() not in ("", "none", "null", "undefined"):
                 # classFullShape text = "ClassName\n---attrs---\n..." — preserve full text for class shapes
@@ -451,8 +457,10 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
     errors = []
 
     # Collect actors and use cases
-    actors   = {}  # norm_name -> original_name
-    use_cases = {} # norm_name -> original_name
+    actors    = {}  # norm_name -> original_name
+    use_cases = {}  # norm_name -> original_name
+    actor_shapes    = {}  # norm_name -> shape dict (for geometry)
+    use_case_shapes = {}  # norm_name -> shape dict (for geometry)
 
     for s in shapes:
         t    = s.get("type", "")
@@ -478,6 +486,7 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
                 })
             else:
                 actors[n] = name
+                actor_shapes[n] = s
 
         elif t == "use_case_oval":
             if not n:
@@ -498,6 +507,7 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
                 })
             else:
                 use_cases[n] = name
+                use_case_shapes[n] = s
 
                 # ── Noun + Verb check (proper POS-based, catches BOTH directions) ──
                 _pos = _pos_analyze(name)
@@ -541,20 +551,80 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
                     "auto_fix": {"fixable": False},
                 })
 
-    # ── Connection checking ─────────────────────────────────────────────────
-    # Build connected sets from arrow shapes that have non-empty from/to fields.
-    connected = set()
-    for s in shapes:
-        t = s.get("type", "")
-        if any(k in t for k in ("arrow", "line", "association", "connector")):
-            for key in ("from", "to", "startShape", "endShape", "source", "target"):
-                val = _n(str(s.get(key) or ""))
-                if val:
-                    connected.add(val)
+    # ── Connection checking (geometry-based) ────────────────────────────────
+    # The drawing app's lines may not carry explicit from/to NAME fields —
+    # they're positioned shapes (position + endPosition) that visually touch
+    # the actor/use-case shape. Checking only from/to name fields caused
+    # false ISOLATED_USE_CASE / DISCONNECTED_ACTOR reports for diagrams that
+    # ARE connected. We now check both: explicit name fields (fast path) AND
+    # geometric line-touching (matches usecase_validator.py's proven logic).
+    _HIT_RADIUS = 40.0
+    _LINE_TYPE_KEYWORDS = ("arrow", "line", "association", "connector",
+                           "dependency", "generalization", "extend", "include")
 
-    # DISCONNECTED_ACTOR: actor with no arrow connecting to any use case
+    def _pos(shape):
+        p = shape.get("position") or {}
+        try:
+            return float(p.get("dx", 0)), float(p.get("dy", 0))
+        except (TypeError, ValueError):
+            return 0.0, 0.0
+
+    def _size(shape):
+        sz = shape.get("size") or {}
+        try:
+            return float(sz.get("width", 80)), float(sz.get("height", 60))
+        except (TypeError, ValueError):
+            return 80.0, 60.0
+
+    def _bbox(shape):
+        x, y = _pos(shape)
+        w, h = _size(shape)
+        return x, y, x + w, y + h
+
+    def _end_abs(line):
+        ep = line.get("endPosition")
+        if ep is None:
+            return None
+        px, py = _pos(line)
+        try:
+            return px + float(ep.get("dx", 0)), py + float(ep.get("dy", 0))
+        except (TypeError, ValueError):
+            return None
+
+    def _pt_near_bbox(px, py, x1, y1, x2, y2, radius=_HIT_RADIUS):
+        cx = max(x1, min(px, x2))
+        cy = max(y1, min(py, y2))
+        return math.hypot(px - cx, py - cy) <= radius
+
+    def _line_touches(line, shape):
+        bb = _bbox(shape)
+        sx, sy = _pos(line)
+        if _pt_near_bbox(sx, sy, *bb):
+            return True
+        end = _end_abs(line)
+        if end and _pt_near_bbox(end[0], end[1], *bb):
+            return True
+        return False
+
+    line_shapes = [s for s in shapes
+                   if any(k in str(s.get("type", "")).lower() for k in _LINE_TYPE_KEYWORDS)]
+
+    # Fast path: explicit from/to/source/target NAME fields (when the app
+    # does provide them).
+    connected_by_name = set()
+    for s in line_shapes:
+        for key in ("from", "to", "startShape", "endShape", "source", "target"):
+            val = _n(str(s.get(key) or ""))
+            if val:
+                connected_by_name.add(val)
+
+    # DISCONNECTED_ACTOR: actor with no line touching it (by name OR geometry)
     for norm_name, orig_name in actors.items():
-        if norm_name not in connected:
+        shape = actor_shapes.get(norm_name)
+        is_connected = norm_name in connected_by_name or (
+            shape is not None and any(_line_touches(ln, shape) for ln in line_shapes)
+        )
+        if not is_connected:
             errors.append({
                 "error_type": "DISCONNECTED_ACTOR", "severity": "ERROR",
                 "element": orig_name,
@@ -563,9 +633,13 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
                 "auto_fix": {"fixable": False},
             })
 
-    # ISOLATED_USE_CASE: use case oval with no arrow connecting to any actor
+    # ISOLATED_USE_CASE: use case oval with no line touching it (by name OR geometry)
     for norm_name, orig_name in use_cases.items():
-        if norm_name not in connected:
+        shape = use_case_shapes.get(norm_name)
+        is_connected = norm_name in connected_by_name or (
+            shape is not None and any(_line_touches(ln, shape) for ln in line_shapes)
+        )
+        if not is_connected:
             errors.append({
                 "error_type": "ISOLATED_USE_CASE", "severity": "ERROR",
                 "element": orig_name,
@@ -801,6 +875,9 @@ def _rule_check_class(shapes: List[Dict], scenario: str = "") -> List[Dict]:
 
         frm_disp = class_names.get(frm_n, frm_raw)
         to_disp  = class_names.get(to_n,  to_raw)
+        shape_id = str(s.get("id") or "").strip()
+        shape_position     = s.get("position") or None
+        shape_end_position = s.get("endPosition") or None
 
         m_start = str(s.get("multiplicity_start") or "").strip()
         m_end   = str(s.get("multiplicity_end")   or "").strip()
@@ -812,7 +889,8 @@ def _rule_check_class(shapes: List[Dict], scenario: str = "") -> List[Dict]:
                 "element": f"{frm_disp} \u2192 {to_disp}",
                 "description": f"Relationship '{frm_disp}' \u2192 '{to_disp}' is missing multiplicity on both ends.",
                 "suggestion": "Add multiplicity labels (e.g., '1', '0..*', '1..*') on both sides of the relationship.",
-                "auto_fix": {"fixable": True, "action": "update_multiplicity",
+                "auto_fix": {"fixable": True, "action": "update_multiplicity", "shape_id": shape_id,
+                             "position": shape_position, "end_position": shape_end_position,
                              "from_element": frm_disp, "to_element": to_disp,
                              "multiplicity_from": "1", "multiplicity_to": "*"},
             })
@@ -822,7 +900,8 @@ def _rule_check_class(shapes: List[Dict], scenario: str = "") -> List[Dict]:
                 "element": f"{frm_disp} \u2192 {to_disp}",
                 "description": f"Relationship '{frm_disp}' \u2192 '{to_disp}' is missing multiplicity on the '{frm_disp}' side.",
                 "suggestion": f"Add a multiplicity label (e.g., '1', '0..*') on the '{frm_disp}' side.",
-                "auto_fix": {"fixable": True, "action": "update_multiplicity",
+                "auto_fix": {"fixable": True, "action": "update_multiplicity", "shape_id": shape_id,
+                             "position": shape_position, "end_position": shape_end_position,
                              "from_element": frm_disp, "to_element": to_disp,
                              "multiplicity_from": "1", "multiplicity_to": m_end},
             })
@@ -832,7 +911,8 @@ def _rule_check_class(shapes: List[Dict], scenario: str = "") -> List[Dict]:
                 "element": f"{frm_disp} \u2192 {to_disp}",
                 "description": f"Relationship '{frm_disp}' \u2192 '{to_disp}' is missing multiplicity on the '{to_disp}' side.",
                 "suggestion": f"Add a multiplicity label (e.g., '1', '0..*') on the '{to_disp}' side.",
-                "auto_fix": {"fixable": True, "action": "update_multiplicity",
+                "auto_fix": {"fixable": True, "action": "update_multiplicity", "shape_id": shape_id,
+                             "position": shape_position, "end_position": shape_end_position,
                              "from_element": frm_disp, "to_element": to_disp,
                              "multiplicity_from": m_start, "multiplicity_to": "*"},
             })
@@ -872,7 +952,8 @@ def _rule_check_class(shapes: List[Dict], scenario: str = "") -> List[Dict]:
                 "element": f"{frm_disp} \u2192 {to_disp}",
                 "description": "Association Name is required",
                 "suggestion": _suggestion,
-                "auto_fix": {"fixable": bool(_guess), "action": "add_label",
+                "auto_fix": {"fixable": bool(_guess), "action": "add_label", "shape_id": shape_id,
+                             "position": shape_position, "end_position": shape_end_position,
                              "from_element": frm_disp, "to_element": to_disp,
                              "label": _guess},
             })
@@ -1998,10 +2079,11 @@ def _build_image_prompt(diagram_type: str, scenario: str) -> str:
 7. MISSING_SYSTEM_BOUNDARY — System boundary box is entirely absent. Only report if you CANNOT SEE any rectangle/box enclosing use cases.
 8. WRONG_SYSTEM_BOUNDARY_NAME — Boundary EXISTS but its label doesn't match scenario system name. Say "change name from X to Y" — never say "add a new boundary".
 9. WRONG_RELATIONSHIP — include/extend/generalization used incorrectly.
-10. MISSING_VERB_IN_USE_CASE — Use case name missing action verb.
-11. DUPLICATE_ACTOR — Same actor name appears twice.
-12. DUPLICATE_USE_CASE — Same use case name appears twice.
-13. SPELLING_MISTAKE   — An actor or use case name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_ACTOR/MISSING_USE_CASE or EXTRA_ACTOR/EXTRA_USE_CASE for the same element.
+10. MISSING_VERB_IN_USE_CASE — Use case name missing action verb (e.g. just "Reports", no verb).
+11. MISSING_NOUN — Use case name has a verb but no noun/object (e.g. just "Manage", "Login" with no object). A valid use case name needs BOTH a verb AND a noun (e.g. "Manage Order", "Place Order").
+12. DUPLICATE_ACTOR — Same actor name appears twice.
+13. DUPLICATE_USE_CASE — Same use case name appears twice.
+14. SPELLING_MISTAKE   — An actor or use case name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_ACTOR/MISSING_USE_CASE or EXTRA_ACTOR/EXTRA_USE_CASE for the same element.
 CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisation as missing/extra."""
         dtype_label = "USE CASE"
         extra_rules = """
@@ -2046,7 +2128,7 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
         rules = """1. MISSING_CLASS — Important nouns in scenario must be class boxes. Only explicitly named entities.
 2. EXTRA_CLASS — Class not in scenario (warning).
 3. WRONG_CLASS_CAPITALISATION — Class starts with lowercase. Suggest capitalising. Do NOT say remove it.
-4. WRONG_RELATIONSHIP_TYPE — Wrong arrow type used.
+4. WRONG_RELATIONSHIP_TYPE — Wrong arrow type used. Identify each arrow by its VISUAL style: plain line = association; line with a HOLLOW (unfilled) diamond = aggregation; line with a FILLED (solid) diamond = composition; line with a HOLLOW (unfilled) triangle arrowhead = generalization/inheritance; DASHED line with an open arrowhead = dependency. Compare the drawn style against what the scenario implies (e.g. "is a kind of" → generalization; "is part of and cannot exist without" → composition; "is part of but can exist independently" → aggregation) and report if they don't match.
 5. MISSING_RELATIONSHIP — Relationship EXPLICITLY in scenario but not drawn. Do NOT invent relationships.
 6. MISSING_MULTIPLICITY — Association arrow drawn but multiplicity labels are absent.
 7. WRONG_MULTIPLICITY — Multiplicity present but value differs from scenario.
