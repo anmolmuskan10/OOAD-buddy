@@ -427,29 +427,43 @@ def _get_pos_model():
 def _pos_analyze(name: str) -> Dict[str, bool]:
     """
     Analyze a shape name and return {'has_verb': bool, 'has_noun': bool}.
-    Uses real POS tagging when spaCy is available; otherwise falls back to
-    a keyword-list heuristic (still checks BOTH verb presence and noun
-    presence, unlike the old first-word-only check).
+    Combines real POS tagging (when spaCy is available) WITH the keyword-list
+    / word-position heuristic, instead of relying on spaCy alone.
+
+    Why: spaCy's tagger is trained on full sentences. Short, context-free,
+    imperative UML use-case labels like "Track Order" or "Book Room" are
+    frequently mistagged (e.g. "Track"/"Book" tagged as NOUN instead of VERB),
+    which was causing CORRECT "Verb + Noun" names to be wrongly flagged as
+    missing a verb or noun. To avoid these false positives, a word that is a
+    known action verb (first word, from _FALLBACK_VERBS) or that follows the
+    standard UML "Verb Noun" convention (a second word = the object/noun) is
+    always honoured, in addition to whatever spaCy detects.
     """
     name = (name or "").strip()
     if not name:
         return {"has_verb": False, "has_noun": False}
 
+    words = [w.lower() for w in name.split()]
+    known_verb = bool(words) and words[0] in _FALLBACK_VERBS
+
     nlp = _get_pos_model()
     if nlp is not None:
         doc = nlp(name)
-        has_verb = any(t.pos_ in ("VERB", "AUX") for t in doc)
-        has_noun = any(t.pos_ in ("NOUN", "PROPN") for t in doc)
+        has_verb = any(t.pos_ in ("VERB", "AUX") for t in doc) or known_verb
+        has_noun = (
+            any(t.pos_ in ("NOUN", "PROPN") for t in doc)
+            or (len(words) > 1)          # 2nd+ word = object/noun by convention
+            or (len(words) == 1 and not known_verb)
+        )
         return {"has_verb": has_verb, "has_noun": has_noun}
 
-    # ── Fallback: keyword-list heuristic ──
+    # ── Fallback: keyword-list heuristic (spaCy unavailable) ──
     # spaCy unavailable — use a conservative convention-based heuristic instead
     # of pure list-membership, since words like "order"/"report" can be BOTH
     # noun and verb and a naive list lookup would misclassify "Manage Order".
-    words = [w.lower() for w in name.split()]
     if not words:
         return {"has_verb": False, "has_noun": False}
-    has_verb = words[0] in _FALLBACK_VERBS
+    has_verb = known_verb
     if len(words) > 1:
         # Standard UML naming convention is "Verb Noun" (e.g. "Manage Order") —
         # trust that a second word is the object/noun.
@@ -457,6 +471,7 @@ def _pos_analyze(name: str) -> Dict[str, bool]:
     else:
         has_noun = words[0] not in _FALLBACK_VERBS
     return {"has_verb": has_verb, "has_noun": has_noun}
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
