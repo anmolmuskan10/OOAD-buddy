@@ -331,6 +331,150 @@ def _arrow_endpoint(s: Dict, side: str) -> str:
     return ""
 
 
+def _shape_geometry(s: Dict) -> Optional[Dict[str, float]]:
+    """
+    Extract a bounding box {x, y, width, height} for a shape from whatever
+    position/size fields the drawing app happens to store. Real canvas apps
+    usually store geometry as coordinates (not names), and different widgets
+    use different field conventions, so we try the common ones.
+    Returns None if no usable geometry is found on this shape.
+    """
+    x = s.get("x", s.get("left", s.get("dx")))
+    y = s.get("y", s.get("top", s.get("dy")))
+    w = s.get("width", s.get("w"))
+    h = s.get("height", s.get("h"))
+
+    pos = s.get("position") or s.get("offset") or {}
+    if isinstance(pos, dict):
+        if x is None: x = pos.get("dx", pos.get("x"))
+        if y is None: y = pos.get("dy", pos.get("y"))
+    size = s.get("size") or {}
+    if isinstance(size, dict):
+        if w is None: w = size.get("width")
+        if h is None: h = size.get("height")
+
+    rect = s.get("bounds") or s.get("rect") or {}
+    if isinstance(rect, dict):
+        if x is None: x = rect.get("x", rect.get("left"))
+        if y is None: y = rect.get("y", rect.get("top"))
+        if w is None:
+            if "width" in rect:
+                w = rect.get("width")
+            elif "right" in rect and "left" in rect:
+                try: w = float(rect["right"]) - float(rect["left"])
+                except (TypeError, ValueError): pass
+        if h is None:
+            if "height" in rect:
+                h = rect.get("height")
+            elif "bottom" in rect and "top" in rect:
+                try: h = float(rect["bottom"]) - float(rect["top"])
+                except (TypeError, ValueError): pass
+
+    try:
+        if x is None or y is None:
+            return None
+        x, y = float(x), float(y)
+        w = float(w) if w is not None else 0.0
+        h = float(h) if h is not None else 0.0
+        return {"x": x, "y": y, "width": w, "height": h}
+    except (TypeError, ValueError):
+        return None
+
+
+def _line_endpoints(s: Dict):
+    """
+    Extract (start_point, end_point) for a line/arrow shape from whatever
+    coordinate fields the drawing app stores — a points array, nested
+    start/end dicts, or flat x1/y1/x2/y2-style fields. Returns None if
+    there isn't enough geometry info on this shape.
+    """
+    def _pt(d):
+        if not isinstance(d, dict):
+            return None
+        px = d.get("dx", d.get("x"))
+        py = d.get("dy", d.get("y"))
+        try:
+            return (float(px), float(py))
+        except (TypeError, ValueError):
+            return None
+
+    pts = s.get("points")
+    if isinstance(pts, list) and len(pts) >= 2:
+        p1, p2 = _pt(pts[0]), _pt(pts[-1])
+        if p1 and p2:
+            return p1, p2
+
+    p1 = _pt(s.get("startPoint") or s.get("start") or s.get("from_point"))
+    p2 = _pt(s.get("endPoint") or s.get("end") or s.get("to_point"))
+    if p1 and p2:
+        return p1, p2
+
+    try:
+        x1 = s.get("x1", s.get("startX"))
+        y1 = s.get("y1", s.get("startY"))
+        x2 = s.get("x2", s.get("endX"))
+        y2 = s.get("y2", s.get("endY"))
+        if None not in (x1, y1, x2, y2):
+            return (float(x1), float(y1)), (float(x2), float(y2))
+    except (TypeError, ValueError):
+        pass
+
+    return None
+
+
+def _point_touches_shape(point: tuple, s: Dict, pad: float = 40.0) -> bool:
+    """
+    True if `point` (a line/arrow endpoint) lies inside — or within `pad`
+    pixels of — the shape's bounding box. The padding gives slack for lines
+    that visually stop just short of / just past a shape's edge, which is
+    normal in freehand/canvas drawing.
+    """
+    g = _shape_geometry(s)
+    if not g:
+        return False
+    x0, y0 = g["x"] - pad, g["y"] - pad
+    x1, y1 = g["x"] + g["width"] + pad, g["y"] + g["height"] + pad
+    return x0 <= point[0] <= x1 and y0 <= point[1] <= y1
+
+
+def _build_geometric_connections(shapes: List[Dict], node_types=("actor", "use_case_oval")) -> set:
+    """
+    FIX (false 'isolated use case' / 'disconnected actor'):
+    Real drawing apps often store lines/arrows as raw coordinates only —
+    no 'from'/'to' name fields at all. The old connection check only looked
+    at name fields, so `connected` was always empty and every actor/use-case
+    got flagged as isolated/disconnected regardless of how it was actually
+    drawn. This scans arrow geometry and matches each endpoint against the
+    bounding box of nearby actor/use-case shapes.
+    Returns the set of normalized shape names touched by at least one
+    geometrically-matching arrow endpoint.
+    """
+    connected = set()
+    nodes = [s for s in shapes if s.get("type") in node_types]
+    if not nodes:
+        return connected
+
+    arrow_types = {
+        "arrow", "association_arrow", "dashed_arrow", "dashed_open_arrow",
+        "dotted_arrow", "include_extend_arrow", "generalization_arrow",
+        "line", "straightline",
+    }
+    for s in shapes:
+        if s.get("type") not in arrow_types:
+            continue
+        endpoints = _line_endpoints(s)
+        if not endpoints:
+            continue
+        p1, p2 = endpoints
+        for node in nodes:
+            name = _n(_shape_name(node))
+            if not name:
+                continue
+            if _point_touches_shape(p1, node) or _point_touches_shape(p2, node):
+                connected.add(name)
+    return connected
+
+
 def _build_connection_map(shapes: List[Dict]) -> Dict[str, set]:
     """
     Build a map: normalized_element_name -> set of normalized names it connects to.
@@ -417,11 +561,30 @@ def _pos_analyze(name: str) -> Dict[str, bool]:
     if not name:
         return {"has_verb": False, "has_noun": False}
 
+    words = [w.lower() for w in re.findall(r"[A-Za-z']+", name)]
+    first_word_is_known_verb = bool(words) and words[0] in _FALLBACK_VERBS
+
     nlp = _get_pos_model()
     if nlp is not None:
         doc = nlp(name)
         has_verb = any(t.pos_ in ("VERB", "AUX") for t in doc)
         has_noun = any(t.pos_ in ("NOUN", "PROPN") for t in doc)
+
+        # FIX (Missing Noun false-negative): spaCy tags a bare 1-2 word label
+        # with no surrounding sentence context, so it very often mis-tags
+        # common UML action verbs ("Login", "Search", "Process", "Update",
+        # "Checkout", "Book"...) as NOUN/PROPN instead of VERB — e.g. "Login"
+        # alone comes back has_verb=False, has_noun=True, so MISSING_NOUN
+        # never fires even though the use case is really verb-only.
+        # Trust the domain verb list to correct spaCy here.
+        if first_word_is_known_verb:
+            has_verb = True
+            if len(words) == 1:
+                # A single word that IS a known verb has no separate
+                # noun/object — don't let spaCy's mis-tag of that SAME
+                # word count as satisfying the "noun" requirement.
+                has_noun = False
+
         return {"has_verb": has_verb, "has_noun": has_noun}
 
     # ── Fallback: keyword-list heuristic ──
@@ -552,6 +715,12 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
                 if val:
                     connected.add(val)
 
+    # FIX: name-based fields ('from'/'to') are frequently absent — the app
+    # may only store line geometry (coordinates). Fall back to geometric
+    # proximity so real connections aren't missed just because there's no
+    # name field on the arrow.
+    connected |= _build_geometric_connections(shapes)
+
     # DISCONNECTED_ACTOR: actor with no arrow connecting to any use case
     for norm_name, orig_name in actors.items():
         if norm_name not in connected:
@@ -589,7 +758,141 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
     return errors
 
 
-def _rule_check_class(shapes: List[Dict]) -> List[Dict]:
+# ─────────────────────────────────────────────────────────────────────────────
+# ASSOCIATION LABEL GUESSER
+# Jab MISSING_ASSOCIATION_NAME error aaye, sirf "add a name" bolna kaafi nahi —
+# scenario text se khud guess karo ke kya likhna chahiye:
+#   - explicit phrases ("has a", "is a", "works for", "placed by",
+#     "reports to", "belongs to") seedha label ban jaate hain
+#   - modal verbs present-tense mein normalize hote hain
+#     ("can place" -> "places", "will manage" -> "manages")
+#   - 2 verbs ho to generic (is/are/has/have) ki bajaye specific wala verb
+#     prefer hota hai ("has" + "manages" -> "manages")
+#   - spaCy available ho to uska lemma nikal ke present-tense banate hain,
+#     warna fallback verb-list se
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ASSOC_EXPLICIT_PHRASES = [
+    ("has a", "has a"), ("has an", "has a"), ("have a", "has a"), ("have an", "has a"),
+    ("is a", "is a"), ("is an", "is a"), ("are a", "is a"), ("are an", "is a"),
+    ("works for", "works for"), ("work for", "works for"),
+    ("placed by", "placed by"),
+    ("reports to", "reports to"), ("report to", "reports to"),
+    ("belongs to", "belongs to"), ("belong to", "belongs to"),
+]
+
+_ASSOC_GENERIC_LEMMAS = {"is", "are", "was", "were", "be", "being", "been", "have", "has", "had"}
+
+_ASSOC_MODAL_RE = re.compile(r"^(?:can|could|may|might|shall|should|will|would|must)\s+(.+)$", re.I)
+
+_ASSOC_IRREGULAR_PRESENT = {"have": "has", "go": "goes", "do": "does", "be": "is"}
+
+
+def _to_present_tense(verb: str) -> str:
+    """Convert a base-form verb to 3rd-person-singular present tense."""
+    v = (verb or "").lower().strip()
+    if not v:
+        return v
+    if v in _ASSOC_IRREGULAR_PRESENT:
+        return _ASSOC_IRREGULAR_PRESENT[v]
+    if v.endswith("s") or v.endswith("ed") or v.endswith("ing"):
+        # Already looks conjugated/inflected somehow — leave it, rather than
+        # double-inflect (e.g. don't turn an already-present-tense "manages"
+        # into "manageses").
+        if v.endswith("s") and not v.endswith(("ss", "us")):
+            return v
+    if v.endswith("y") and len(v) > 1 and v[-2] not in "aeiou":
+        return v[:-1] + "ies"
+    if v.endswith(("s", "x", "z", "ch", "sh", "o")):
+        return v + "es"
+    return v + "s"
+
+
+def _normalize_verb_phrase(phrase: str) -> str:
+    """Strip a leading modal ('can place' -> 'place') then present-tense it."""
+    phrase = (phrase or "").strip().lower()
+    m = _ASSOC_MODAL_RE.match(phrase)
+    if m:
+        phrase = m.group(1).strip()
+    words = phrase.split()
+    if not words:
+        return ""
+    if words[0] == "to" and len(words) > 1:
+        words = words[1:]
+    return _to_present_tense(words[0]) if words else ""
+
+
+def _guess_association_label(scenario: str, from_name: str, to_name: str) -> str:
+    """
+    Reverse-engineer the natural-language relationship label between two
+    classes from the scenario text, to suggest as an association name:
+      1. Explicit relationship phrases win outright ("has a", "is a",
+         "works for", "placed by", "reports to", "belongs to").
+      2. Otherwise pick the verb (via spaCy, or the fallback verb list)
+         connecting the two class names in a sentence that mentions both —
+         preferring a specific action verb over a generic linking verb
+         (is/are/has/have) when both appear.
+      3. Modal verbs are normalized to present tense
+         ("can place" -> "places", "will manage" -> "manages").
+    Returns "" if nothing can be confidently guessed (caller should fall
+    back to a generic suggestion in that case).
+    """
+    if not scenario or not from_name or not to_name:
+        return ""
+
+    fn, tn = from_name.strip().lower(), to_name.strip().lower()
+    if not fn or not tn:
+        return ""
+
+    sentences = re.split(r"(?<=[.!?])\s+", scenario)
+    candidate_sentences = [s for s in sentences if fn in s.lower() and tn in s.lower()]
+    if not candidate_sentences:
+        return ""
+
+    for sent in candidate_sentences:
+        low = sent.lower()
+
+        # 1. Explicit phrases win outright — but only when `to_name` actually
+        # appears in the same clause right after the phrase, so a compound
+        # sentence like "Manager has a Department and manages Employees"
+        # doesn't leak the "has a" label onto the unrelated Manager→Employees
+        # pair (whose real relationship, "manages", is in the next clause).
+        for phrase, label in _ASSOC_EXPLICIT_PHRASES:
+            idx = low.find(phrase)
+            if idx == -1:
+                continue
+            after = low[idx + len(phrase):]
+            clause_breaks = [after.find(b) for b in (" and ", ", ", "; ") if after.find(b) != -1]
+            clause_end = min(clause_breaks) if clause_breaks else len(after)
+            if tn in after[:clause_end]:
+                return label
+
+        # 2. spaCy-based verb extraction (preferred — actual POS tagging)
+        nlp = _get_pos_model()
+        if nlp is not None:
+            doc = nlp(sent)
+            verbs = [t for t in doc if t.pos_ in ("VERB", "AUX")]
+            if verbs:
+                specific = [t for t in verbs if t.lemma_.lower() not in _ASSOC_GENERIC_LEMMAS]
+                chosen = specific[-1] if specific else verbs[-1]
+                label = _to_present_tense(chosen.lemma_.lower())
+                if label:
+                    return label
+
+        # 3. Keyword-list fallback (spaCy unavailable)
+        words = re.findall(r"[a-zA-Z']+", low)
+        found = [w for w in words if w in _FALLBACK_VERBS or w in _ASSOC_GENERIC_LEMMAS]
+        if found:
+            specific = [w for w in found if w not in _ASSOC_GENERIC_LEMMAS]
+            chosen = specific[-1] if specific else found[-1]
+            label = _to_present_tense(chosen)
+            if label:
+                return label
+
+    return ""
+
+
+def _rule_check_class(shapes: List[Dict], scenario: str = "") -> List[Dict]:
     """Deterministic rule checks for class diagrams."""
     errors = []
     class_names = {}  # norm -> original
@@ -712,13 +1015,25 @@ def _rule_check_class(shapes: List[Dict]) -> List[Dict]:
                 if len(parts) >= 2:
                     label = parts[1].strip()
         if not label:
-            errors.append({
-                "error_type": "MISSING_ASSOCIATION_NAME", "severity": "ERROR",
-                "element": f"{frm_disp} \u2192 {to_disp}",
-                "description": "Association Name is required",
-                "suggestion": f"Add a name label at the midpoint of the line between '{frm_disp}' and '{to_disp}'.",
-                "auto_fix": {"fixable": False},
-            })
+            guessed = _guess_association_label(scenario, frm_disp, to_disp)
+            if guessed:
+                errors.append({
+                    "error_type": "MISSING_ASSOCIATION_NAME", "severity": "ERROR",
+                    "element": f"{frm_disp} \u2192 {to_disp}",
+                    "description": "Association Name is required",
+                    "suggestion": f"Add the label '{guessed}' at the midpoint of the line between '{frm_disp}' and '{to_disp}' (guessed from the scenario).",
+                    "auto_fix": {"fixable": True, "action": "add_label",
+                                 "from_element": frm_disp, "to_element": to_disp,
+                                 "label": guessed},
+                })
+            else:
+                errors.append({
+                    "error_type": "MISSING_ASSOCIATION_NAME", "severity": "ERROR",
+                    "element": f"{frm_disp} \u2192 {to_disp}",
+                    "description": "Association Name is required",
+                    "suggestion": f"Add a name label at the midpoint of the line between '{frm_disp}' and '{to_disp}', e.g. a verb describing the relationship (e.g. 'manages', 'has a').",
+                    "auto_fix": {"fixable": False},
+                })
 
     return errors
 
@@ -768,12 +1083,12 @@ def _rule_check_sequence(shapes: List[Dict]) -> List[Dict]:
     return errors
 
 
-def _run_rule_checks(shapes: List[Dict], diagram_type: str) -> List[Dict]:
+def _run_rule_checks(shapes: List[Dict], diagram_type: str, scenario: str = "") -> List[Dict]:
     dt = diagram_type.lower()
     if "usecase" in dt or "use_case" in dt or "use case" in dt:
         return _rule_check_usecase(shapes)
     elif "class" in dt:
-        return _rule_check_class(shapes)
+        return _rule_check_class(shapes, scenario)
     elif "sequence" in dt:
         return _rule_check_sequence(shapes)
     return []
@@ -1746,7 +2061,7 @@ def validate_with_openai(
     _log.info("Sanitized shapes: %d → %d (diagram: %s)", len(shapes), len(clean_shapes), diagram_type)
 
     # Step 2 — Run deterministic rule-based checks (connections, duplicates, empty names)
-    rule_errors = _run_rule_checks(clean_shapes, diagram_type)
+    rule_errors = _run_rule_checks(clean_shapes, diagram_type, scenario)
     _log.info("Rule checks: %d issues found", len(rule_errors))
 
     # Step 3 — Ask LLM only for scenario-semantic checks
