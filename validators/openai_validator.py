@@ -435,6 +435,21 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
                         "auto_fix": {"fixable": True, "action": "rename_shape", "name": f"Manage {name}"},
                     })
 
+    # ── Blank/Empty Use Case check ──────────────────────────────────────────
+    # Check every use case oval — if it has no text → EMPTY_USE_CASE_LABEL error
+    for s in shapes:
+        t = s.get("type", "").lower()
+        if "usecase" in t or "use_case" in t or "oval" in t or "ellipse" in t:
+            label = str(s.get("text", "") or s.get("label", "") or s.get("name", "") or "").strip()
+            if not label or label.lower() in ("", "none", "null", "undefined", "use case", "usecase"):
+                errors.append({
+                    "error_type": "EMPTY_USE_CASE_LABEL", "severity": "ERROR",
+                    "element": "Unlabelled use case",
+                    "description": "A use case oval has no label or an empty name.",
+                    "suggestion": "Give this use case a meaningful name e.g. 'Place Order', 'Browse Products'.",
+                    "auto_fix": {"fixable": False},
+                })
+
     # ── Connection checking ─────────────────────────────────────────────────
     # Build connected sets from arrow shapes that have non-empty from/to fields.
     connected = set()
@@ -1032,14 +1047,20 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: NEVER report MISSING_MULTIPLICITY for an arrow that has multiplicity_start or multiplicity_end set, even if only one side has a value.
 - STRICT: Do NOT suggest a specific multiplicity value (like "1 to *") unless the scenario explicitly states it.
 
-### WRONG_MULTIPLICITY:
-- Check EVERY association, aggregation, and composition arrow that has multiplicity values set.
+### WRONG_MULTIPLICITY (WARNING) ← ALWAYS CHECK:
+- Check EVERY association, aggregation, and composition arrow that HAS multiplicity values.
+- Look at multiplicity_start and multiplicity_end fields in each arrow shape.
 - Compare drawn multiplicity against what the scenario describes.
-- Example: scenario says "one customer places many orders" → Customer end = "1", Order end = "*" or "1..*".
-- If drawn multiplicity values do NOT match scenario intent → report WRONG_MULTIPLICITY as WARNING.
-- Provide correct values in auto_fix: multiplicity_from and multiplicity_to.
-- STRICT: Only report if scenario EXPLICITLY states the relationship cardinality.
-- STRICT: If scenario does not mention specific multiplicity → do NOT report WRONG_MULTIPLICITY.
+- Examples of wrong multiplicity:
+  * Scenario: "one customer places many orders" → must be "1" on Customer side, "*" on Order side.
+    If drawn as "*" on both sides → WRONG_MULTIPLICITY.
+  * Scenario: "a student enrolls in many courses, a course has many students" → must be "* " on both sides.
+    If drawn as "1" on either side → WRONG_MULTIPLICITY.
+- Report element as "ClassA → ClassB" using from/to fields of the arrow.
+- description: "Multiplicity 'X' on ClassA end should be 'Y' based on scenario."
+- auto_fix: fixable: true, action: update_multiplicity, from_element, to_element, multiplicity_from: "correct", multiplicity_to: "correct"
+- STRICT: Only report if scenario CLEARLY states cardinality (one-to-many, many-to-many etc).
+- STRICT: Do NOT guess — only report when you are certain.
 
 ### MISSING_ATTRIBUTE / MISSING_METHOD:
 - STRICT: ONLY report MISSING_ATTRIBUTE if the scenario EXPLICITLY lists specific attributes for a class (e.g. "Customer has attributes: name, email, phone").
@@ -1049,19 +1070,26 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: If the scenario does NOT list attributes/methods → NO error, regardless of what user draws.
 - STRICT: Extra attributes/methods that are NOT in the scenario but user adds → NO error (user can add more than scenario requires).
 
-### MISSING_ASSOCIATION_LABEL:
-- Check EVERY association, aggregation, and composition arrow.
-- If the scenario uses a verb between two entities (e.g. "Bank manages Customer" → label "manages"; "Teacher teaches Student" → label "teaches") and the drawn arrow has NO relationship_label → report MISSING_ASSOCIATION_LABEL as WARNING.
-- element: "ClassA → ClassB", suggestion: "Add label 'verb' to the arrow."
-- auto_fix: fixable: true, action: add_label, from_element, to_element, label: <verb from scenario>
-- STRICT: Only report if scenario EXPLICITLY names the relationship with a verb.
-- STRICT: If scenario does NOT name the relationship → do NOT report missing label.
+### MISSING_ASSOCIATION_LABEL (WARNING) ← CHECK THIS:
+- Check EVERY association, aggregation, and composition arrow in the diagram.
+- Look at the relationship_label field AND the text field of each arrow.
+- If the scenario uses a VERB to describe the relationship (e.g. "Bank manages Customer", "Teacher teaches Student") AND the drawn arrow has NO label → report MISSING_ASSOCIATION_LABEL as WARNING.
+- element: "ClassA → ClassB"
+- description: "Association between ClassA and ClassB is missing a label."
+- suggestion: "Add label 'verb' to the arrow between ClassA and ClassB."
+- auto_fix: fixable: true, action: add_label, from_element: "ClassA", to_element: "ClassB", label: "<verb from scenario>"
+- STRICT: Only report when scenario explicitly describes the relationship with a verb.
+- STRICT: If scenario does not name the relationship → do NOT report.
 
-### WRONG_ASSOCIATION_LABEL:
-- If an arrow HAS a label but the label does NOT match what the scenario describes → report WRONG_ASSOCIATION_LABEL as WARNING.
-- Example: scenario says "manages" but arrow says "contains" → WRONG_ASSOCIATION_LABEL.
-- auto_fix: fixable: true, action: add_label, from_element, to_element, label: <correct label from scenario>
-- STRICT: Only report if scenario explicitly names the label AND the drawn label is clearly different.
+### WRONG_ASSOCIATION_LABEL (WARNING) ← CHECK THIS:
+- Check EVERY association, aggregation, and composition arrow that HAS a label.
+- If the drawn label does NOT match what the scenario describes → report WRONG_ASSOCIATION_LABEL as WARNING.
+- Example: scenario says "Bank manages Customer" but arrow label says "owns" → WRONG_ASSOCIATION_LABEL.
+- Example: scenario says "Teacher teaches Student" but arrow label says "trains" → WRONG_ASSOCIATION_LABEL.
+- description: "Label 'X' on arrow ClassA → ClassB should be 'Y' based on scenario."
+- auto_fix: fixable: true, action: add_label, from_element: "ClassA", to_element: "ClassB", label: "<correct label>"
+- STRICT: Only report when scenario explicitly names the relationship AND drawn label is clearly different.
+- STRICT: Minor variations (e.g. "manage" vs "manages") are acceptable — do NOT report.
 
 ### General:
 - STRICT: When in doubt about ANY error, SKIP it.
@@ -1106,11 +1134,15 @@ DO NOT CHECK AND DO NOT REPORT:
 - ISOLATED_USE_CASE (handled by rule system)
 - UNLABELLED_USE_CASE (handled by rule system)
 
-### MISSING_NOUN (actor name should be a noun/role):
-- Check EVERY actor name. Actors must represent roles or entities (nouns), NOT actions.
-- If an actor name starts with a verb (e.g. "Login", "Register", "Manage") → report MISSING_NOUN as WARNING.
-- suggestion: "Actor names should be roles/entities like 'Customer', 'Admin', 'System'."
+### WRONG_ACTOR_NAME / MISSING_NOUN (actor name must be a noun/role):
+- Check EVERY actor shape in the diagram.
+- Actor names MUST be nouns/roles (e.g. "Customer", "Admin", "Bank", "System", "User").
+- If actor name is a VERB or action (e.g. "Login", "Register", "Manage", "Browse", "Pay") → report WRONG_ACTOR_NAME as WARNING.
+- If actor name is completely wrong or unrelated to scenario → report WRONG_ACTOR_NAME as WARNING.
+- description: "Actor names must represent roles or entities, not actions."
+- suggestion: "Rename actor to a proper role name like 'Customer' or 'Admin'."
 - auto_fix: fixable: false
+- STRICT: Check ALL actors without exception.
 - DUPLICATE_ACTOR / DUPLICATE_USE_CASE (handled by rule system)
 - UNLABELLED_ACTOR / UNLABELLED_USE_CASE (handled by rule system)
 - Any capitalisation errors — case differences are NEVER errors
