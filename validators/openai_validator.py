@@ -610,30 +610,17 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
             else:
                 use_cases[n] = name
 
-                # ── Noun + Verb check (proper POS-based, catches BOTH directions) ──
+                # ── Use case naming format check: STRICT "Verb + Noun" only ──
+                # A use case oval's label must be exactly a verb followed by a
+                # noun/object (e.g. "Manage Order", "Place Order"). Any name
+                # that does not satisfy BOTH parts is reported as ONE error.
                 _pos = _pos_analyze(name)
-                if _pos["has_verb"] and not _pos["has_noun"]:
-                    errors.append({
-                        "error_type": "MISSING_NOUN", "severity": "WARNING",
-                        "element": name,
-                        "description": f"Use case '{name}' has a verb but no noun/object — it's too vague.",
-                        "suggestion": f"Add an object to '{name}', e.g. '{name} Order' or '{name} Account'.",
-                        "auto_fix": {"fixable": False},
-                    })
-                elif _pos["has_noun"] and not _pos["has_verb"]:
+                if not (_pos["has_verb"] and _pos["has_noun"]):
                     errors.append({
                         "error_type": "MISSING_VERB_IN_USE_CASE", "severity": "WARNING",
                         "element": name,
-                        "description": f"Use case '{name}' does not contain an action verb.",
-                        "suggestion": f"Rename '{name}' to start with a verb, e.g. 'Manage {name}' or 'Process {name}'.",
-                        "auto_fix": {"fixable": True, "action": "rename_shape", "name": f"Manage {name}"},
-                    })
-                elif not _pos["has_verb"] and not _pos["has_noun"]:
-                    errors.append({
-                        "error_type": "MISSING_VERB_IN_USE_CASE", "severity": "WARNING",
-                        "element": name,
-                        "description": f"Use case '{name}' name is unclear — it should contain both an action verb and a noun.",
-                        "suggestion": f"Rename '{name}' to something like 'Manage {name}'.",
+                        "description": f"Use case '{name}' must follow the 'Verb + Noun' naming format (e.g. 'Manage Order', 'Place Order').",
+                        "suggestion": f"Rename '{name}' to a verb + noun, e.g. 'Manage {name}' or 'Process {name}'.",
                         "auto_fix": {"fixable": True, "action": "rename_shape", "name": f"Manage {name}"},
                     })
 
@@ -2150,22 +2137,37 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 - Only report WRONG_MESSAGE_ORDER if you are 100% certain. When in doubt → SKIP."""
 
     else:
-        rules = """1. MISSING_CLASS — Important nouns in scenario must be class boxes. Only explicitly named entities.
-2. EXTRA_CLASS — Class not in scenario (warning).
-3. WRONG_CLASS_CAPITALISATION — Class starts with lowercase. Suggest capitalising. Do NOT say remove it.
-4. WRONG_RELATIONSHIP_TYPE — Wrong arrow type used.
-5. MISSING_RELATIONSHIP — Relationship EXPLICITLY in scenario but not drawn. Do NOT invent relationships.
-6. MISSING_MULTIPLICITY — Association arrow drawn but multiplicity labels are absent.
-7. WRONG_MULTIPLICITY — Multiplicity present but value differs from scenario.
-8. MISSING_ASSOCIATION_LABEL — Scenario names a label for a relationship but it's not on the arrow.
-9. EMPTY_CLASS_NAME — Class has no name or placeholder like "Class 1".
-10. SPELLING_MISTAKE — A class name closely resembles a scenario class name but is misspelled (e.g. "Custmer" vs "Customer"). ONE error only — do NOT also report MISSING_CLASS or EXTRA_CLASS for the same element."""
+        rules = """1. MISSING_CLASS              — Important nouns in scenario must be classes. Only explicitly named entities.
+2. EXTRA_CLASS                — Class in diagram not mentioned in scenario (warning).
+3. WRONG_CLASS_CAPITALISATION — Class name exists but starts with lowercase — suggest capitalising, never suggest removing.
+4. WRONG_RELATIONSHIP_TYPE    — Wrong arrow type vs scenario (association/aggregation/composition/generalization).
+5. MISSING_RELATIONSHIP       — Relationship EXPLICITLY described in scenario but not drawn.
+6. MISSING_MULTIPLICITY       — Association/aggregation/composition arrow drawn but both multiplicity fields are empty.
+7. WRONG_MULTIPLICITY         — Multiplicity present but value is wrong vs scenario.
+8. MISSING_ASSOCIATION_LABEL  — Scenario names a label for a relationship but it is not on the drawn arrow.
+9. WRONG_INHERITANCE_DIRECTION — Inheritance arrow reversed (child should point TO parent).
+10. DUPLICATE_CLASS           — Same class name appears twice.
+11. CIRCULAR_INHERITANCE      — A inherits B and B inherits A.
+12. EMPTY_CLASS_NAME          — Class has no name or placeholder like "Class 1".
+13. SELF_ASSOCIATION          — Class connected to itself (warn unless scenario says so).
+14. SPELLING_MISTAKE          — A class name closely resembles a scenario class name but is misspelled (e.g. "Custmer" instead of "Customer"). ONE error only — do NOT also report MISSING_CLASS or EXTRA_CLASS for the same element."""
         dtype_label = "CLASS"
         extra_rules = """
+## RELATIONSHIP TYPE VALIDATION:
+- If scenario says "is a" / "inherits" / "type of" / "kind of" → expect GENERALIZATION.
+- If scenario says "consists of" / "composed of" / "cannot exist without" → expect COMPOSITION.
+- If scenario says "contains" / "collection of" / "holds" / "is made up of" → expect AGGREGATION.
+- If scenario says "has" / "uses" / "is related to" / "is associated with" → expect ASSOCIATION.
+- Wrong type drawn → report WRONG_RELATIONSHIP_TYPE.
+
 ## CLASS CAPITALISATION RULE:
 - If a class "customer" exists and scenario has "Customer" → report WRONG_CLASS_CAPITALISATION.
 - Suggestion: "Capitalise the first letter: rename 'customer' to 'Customer'."
 - Do NOT report it as EXTRA_CLASS or say to remove it.
+
+## SPELLING MISTAKE RULE:
+- If a class name looks like a misspelling of a scenario class name (e.g. "Custmer" vs "Customer") → report EXACTLY ONE SPELLING_MISTAKE error.
+- Do NOT also report MISSING_CLASS for the correctly-spelled version or EXTRA_CLASS for the misspelled version.
 
 ## RELATIONSHIP RULE:
 - Only report MISSING_RELATIONSHIP if scenario EXPLICITLY states a relationship (has, contains, inherits, etc.).
@@ -2173,7 +2175,26 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 
 ## MISSING LABEL RULE:
 - Only report MISSING_ASSOCIATION_LABEL if scenario names what the relationship should be called.
-- If scenario does not name the relationship → labels are optional."""
+- If scenario does not name the relationship → labels are optional.
+
+## MULTIPLICITY RULES:
+- If a multiplicity value is visible at EITHER end of an association/aggregation/composition arrow → multiplicity EXISTS, do NOT report MISSING_MULTIPLICITY.
+- Only report MISSING_MULTIPLICITY if BOTH ends genuinely show no multiplicity value.
+- WRONG_MULTIPLICITY: only report if the scenario CLEARLY states cardinality (one-to-many, many-to-many, etc.) and the drawn values contradict it.
+- Do NOT suggest a specific multiplicity value unless the scenario explicitly states it.
+
+## INHERITANCE RULES:
+- WRONG_INHERITANCE_DIRECTION — the arrow should point FROM the child class TO the parent class; flag if reversed.
+- CIRCULAR_INHERITANCE — flag if A inherits from B and B inherits from A.
+
+## DUPLICATE / EMPTY / SELF-ASSOCIATION:
+- DUPLICATE_CLASS — same class name appears twice in the image.
+- EMPTY_CLASS_NAME — a class box has no visible name or a placeholder like "Class 1".
+- SELF_ASSOCIATION — a class connects to itself; only flag as a WARNING unless the scenario explicitly describes this.
+
+## MISSING_ATTRIBUTE / MISSING_METHOD:
+- Only report if the scenario EXPLICITLY lists specific attributes or methods for a class.
+- If the scenario does not list them, do NOT report anything missing, regardless of what is drawn."""
 
     return f"""You are an expert UML {dtype_label} Diagram validator using SEMANTIC analysis. You are given an IMAGE of the diagram.
 
