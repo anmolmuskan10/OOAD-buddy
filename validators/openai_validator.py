@@ -18,6 +18,7 @@ FIX: Shape sanitizer added — strips ToolType. prefix, filters shapes by
 import os
 import json
 import logging
+import math
 import re
 import time
 import urllib.request
@@ -145,7 +146,8 @@ def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
         for field in ("text", "label", "name", "id", "from", "to",
                       "startLifeline", "endLifeline", "lifelineRef",
                       "multiplicity_start", "multiplicity_end",
-                      "relationship_label", "attributes", "methods"):
+                      "relationship_label", "attributes", "methods",
+                      "position", "endPosition", "size"):
             val = s.get(field)
             if val is not None and str(val).strip().lower() not in ("", "none", "null", "undefined"):
                 # classFullShape text = "ClassName\n---attrs---\n..." — preserve full text for class shapes
@@ -167,7 +169,7 @@ def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
 # Jab Gemini fixable: true nahi deta, hum error_type se apna fix banate hain
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_fallback_fix(error_type: str, element: str, raw_error: dict, diagram_type: str) -> dict:
+def _build_fallback_fix(error_type: str, element: str, raw_error: dict, diagram_type: str, scenario: str = "") -> dict:
     """
     Gemini ka auto_fix agar incomplete/missing ho — error_type se fallback fix banao.
     Ye ensure karta hai ke common fixable errors hamesha fixable rahein.
@@ -185,6 +187,22 @@ def _build_fallback_fix(error_type: str, element: str, raw_error: dict, diagram_
 
     if "EMPTY_CLASS_NAME" in et:
         return {"fixable": True, "action": "rename_shape", "name": element or "ClassName"}
+
+    if "MISSING_ASSOCIATION_NAME" in et or "MISSING_ASSOCIATION_LABEL" in et:
+        # element is usually "ClassA → ClassB" (or "ClassA - ClassB")
+        from_el, to_el = _parse_from_to(desc + " " + suggestion.lower())
+        if not (from_el and to_el):
+            sep = "\u2192" if "\u2192" in element else ("-" if "-" in element else None)
+            if sep:
+                parts = element.split(sep)
+                if len(parts) >= 2:
+                    from_el, to_el = parts[0].strip(), parts[1].strip()
+        if from_el and to_el:
+            label = _suggest_relationship_label(scenario, from_el, to_el)
+            if label:
+                return {"fixable": True, "action": "add_label",
+                        "from_element": from_el, "to_element": to_el, "name": label}
+        return {"fixable": False}
 
     if "MISSING_RELATIONSHIP" in et or "MISSING_RELATIONSHIP" in et:
         # Try to parse from_element and to_element from description/suggestion
@@ -331,150 +349,6 @@ def _arrow_endpoint(s: Dict, side: str) -> str:
     return ""
 
 
-def _shape_geometry(s: Dict) -> Optional[Dict[str, float]]:
-    """
-    Extract a bounding box {x, y, width, height} for a shape from whatever
-    position/size fields the drawing app happens to store. Real canvas apps
-    usually store geometry as coordinates (not names), and different widgets
-    use different field conventions, so we try the common ones.
-    Returns None if no usable geometry is found on this shape.
-    """
-    x = s.get("x", s.get("left", s.get("dx")))
-    y = s.get("y", s.get("top", s.get("dy")))
-    w = s.get("width", s.get("w"))
-    h = s.get("height", s.get("h"))
-
-    pos = s.get("position") or s.get("offset") or {}
-    if isinstance(pos, dict):
-        if x is None: x = pos.get("dx", pos.get("x"))
-        if y is None: y = pos.get("dy", pos.get("y"))
-    size = s.get("size") or {}
-    if isinstance(size, dict):
-        if w is None: w = size.get("width")
-        if h is None: h = size.get("height")
-
-    rect = s.get("bounds") or s.get("rect") or {}
-    if isinstance(rect, dict):
-        if x is None: x = rect.get("x", rect.get("left"))
-        if y is None: y = rect.get("y", rect.get("top"))
-        if w is None:
-            if "width" in rect:
-                w = rect.get("width")
-            elif "right" in rect and "left" in rect:
-                try: w = float(rect["right"]) - float(rect["left"])
-                except (TypeError, ValueError): pass
-        if h is None:
-            if "height" in rect:
-                h = rect.get("height")
-            elif "bottom" in rect and "top" in rect:
-                try: h = float(rect["bottom"]) - float(rect["top"])
-                except (TypeError, ValueError): pass
-
-    try:
-        if x is None or y is None:
-            return None
-        x, y = float(x), float(y)
-        w = float(w) if w is not None else 0.0
-        h = float(h) if h is not None else 0.0
-        return {"x": x, "y": y, "width": w, "height": h}
-    except (TypeError, ValueError):
-        return None
-
-
-def _line_endpoints(s: Dict):
-    """
-    Extract (start_point, end_point) for a line/arrow shape from whatever
-    coordinate fields the drawing app stores — a points array, nested
-    start/end dicts, or flat x1/y1/x2/y2-style fields. Returns None if
-    there isn't enough geometry info on this shape.
-    """
-    def _pt(d):
-        if not isinstance(d, dict):
-            return None
-        px = d.get("dx", d.get("x"))
-        py = d.get("dy", d.get("y"))
-        try:
-            return (float(px), float(py))
-        except (TypeError, ValueError):
-            return None
-
-    pts = s.get("points")
-    if isinstance(pts, list) and len(pts) >= 2:
-        p1, p2 = _pt(pts[0]), _pt(pts[-1])
-        if p1 and p2:
-            return p1, p2
-
-    p1 = _pt(s.get("startPoint") or s.get("start") or s.get("from_point"))
-    p2 = _pt(s.get("endPoint") or s.get("end") or s.get("to_point"))
-    if p1 and p2:
-        return p1, p2
-
-    try:
-        x1 = s.get("x1", s.get("startX"))
-        y1 = s.get("y1", s.get("startY"))
-        x2 = s.get("x2", s.get("endX"))
-        y2 = s.get("y2", s.get("endY"))
-        if None not in (x1, y1, x2, y2):
-            return (float(x1), float(y1)), (float(x2), float(y2))
-    except (TypeError, ValueError):
-        pass
-
-    return None
-
-
-def _point_touches_shape(point: tuple, s: Dict, pad: float = 40.0) -> bool:
-    """
-    True if `point` (a line/arrow endpoint) lies inside — or within `pad`
-    pixels of — the shape's bounding box. The padding gives slack for lines
-    that visually stop just short of / just past a shape's edge, which is
-    normal in freehand/canvas drawing.
-    """
-    g = _shape_geometry(s)
-    if not g:
-        return False
-    x0, y0 = g["x"] - pad, g["y"] - pad
-    x1, y1 = g["x"] + g["width"] + pad, g["y"] + g["height"] + pad
-    return x0 <= point[0] <= x1 and y0 <= point[1] <= y1
-
-
-def _build_geometric_connections(shapes: List[Dict], node_types=("actor", "use_case_oval")) -> set:
-    """
-    FIX (false 'isolated use case' / 'disconnected actor'):
-    Real drawing apps often store lines/arrows as raw coordinates only —
-    no 'from'/'to' name fields at all. The old connection check only looked
-    at name fields, so `connected` was always empty and every actor/use-case
-    got flagged as isolated/disconnected regardless of how it was actually
-    drawn. This scans arrow geometry and matches each endpoint against the
-    bounding box of nearby actor/use-case shapes.
-    Returns the set of normalized shape names touched by at least one
-    geometrically-matching arrow endpoint.
-    """
-    connected = set()
-    nodes = [s for s in shapes if s.get("type") in node_types]
-    if not nodes:
-        return connected
-
-    arrow_types = {
-        "arrow", "association_arrow", "dashed_arrow", "dashed_open_arrow",
-        "dotted_arrow", "include_extend_arrow", "generalization_arrow",
-        "line", "straightline",
-    }
-    for s in shapes:
-        if s.get("type") not in arrow_types:
-            continue
-        endpoints = _line_endpoints(s)
-        if not endpoints:
-            continue
-        p1, p2 = endpoints
-        for node in nodes:
-            name = _n(_shape_name(node))
-            if not name:
-                continue
-            if _point_touches_shape(p1, node) or _point_touches_shape(p2, node):
-                connected.add(name)
-    return connected
-
-
 def _build_connection_map(shapes: List[Dict]) -> Dict[str, set]:
     """
     Build a map: normalized_element_name -> set of normalized names it connects to.
@@ -561,30 +435,11 @@ def _pos_analyze(name: str) -> Dict[str, bool]:
     if not name:
         return {"has_verb": False, "has_noun": False}
 
-    words = [w.lower() for w in re.findall(r"[A-Za-z']+", name)]
-    first_word_is_known_verb = bool(words) and words[0] in _FALLBACK_VERBS
-
     nlp = _get_pos_model()
     if nlp is not None:
         doc = nlp(name)
         has_verb = any(t.pos_ in ("VERB", "AUX") for t in doc)
         has_noun = any(t.pos_ in ("NOUN", "PROPN") for t in doc)
-
-        # FIX (Missing Noun false-negative): spaCy tags a bare 1-2 word label
-        # with no surrounding sentence context, so it very often mis-tags
-        # common UML action verbs ("Login", "Search", "Process", "Update",
-        # "Checkout", "Book"...) as NOUN/PROPN instead of VERB — e.g. "Login"
-        # alone comes back has_verb=False, has_noun=True, so MISSING_NOUN
-        # never fires even though the use case is really verb-only.
-        # Trust the domain verb list to correct spaCy here.
-        if first_word_is_known_verb:
-            has_verb = True
-            if len(words) == 1:
-                # A single word that IS a known verb has no separate
-                # noun/object — don't let spaCy's mis-tag of that SAME
-                # word count as satisfying the "noun" requirement.
-                has_noun = False
-
         return {"has_verb": has_verb, "has_noun": has_noun}
 
     # ── Fallback: keyword-list heuristic ──
@@ -602,6 +457,99 @@ def _pos_analyze(name: str) -> Dict[str, bool]:
     else:
         has_noun = words[0] not in _FALLBACK_VERBS
     return {"has_verb": has_verb, "has_noun": has_noun}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GEOMETRY-BASED CONNECTION DETECTION — ported from usecase_validator.py
+# (proven spatial-detection logic: position + size + line endpoints touching
+# a shape's bounding box). Used as a SECOND, independent way to detect
+# connections, alongside the existing name-field (from/to) based check.
+# A shape counts as "connected" if EITHER method finds a connection.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Max px distance from a line endpoint to a shape's bbox to count as "touching"
+_HIT_RADIUS = 40.0
+
+# Line/arrow types (already-cleaned names, post _clean_type) that can carry a
+# spatial connection in a use case diagram.
+_USECASE_LINE_TYPES = {
+    "arrow", "line", "dashed_arrow", "dashed_open_arrow", "dotted_arrow",
+    "include_extend_arrow", "generalization_arrow", "association_arrow",
+}
+
+
+def _geo_pos(shape: Dict) -> Optional[tuple]:
+    """Shape's (x, y) position — top-left for shapes, start-point for lines."""
+    p = shape.get("position")
+    if not isinstance(p, dict):
+        return None
+    try:
+        return float(p.get("dx", 0)), float(p.get("dy", 0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _geo_end_abs(shape: Dict) -> Optional[tuple]:
+    """Absolute end point of a line: position + endPosition (relative offset)."""
+    ep = shape.get("endPosition")
+    if not isinstance(ep, dict):
+        return None
+    pos = _geo_pos(shape)
+    if pos is None:
+        return None
+    try:
+        return pos[0] + float(ep.get("dx", 0)), pos[1] + float(ep.get("dy", 0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _geo_size(shape: Dict) -> tuple:
+    s = shape.get("size")
+    if not isinstance(s, dict):
+        return 80.0, 60.0
+    try:
+        return float(s.get("width", 80)), float(s.get("height", 60))
+    except (TypeError, ValueError):
+        return 80.0, 60.0
+
+
+def _geo_bbox(shape: Dict) -> Optional[tuple]:
+    pos = _geo_pos(shape)
+    if pos is None:
+        return None
+    w, h = _geo_size(shape)
+    x, y = pos
+    return x, y, x + w, y + h
+
+
+def _pt_near_bbox(px: float, py: float, bbox: tuple, radius: float = _HIT_RADIUS) -> bool:
+    """True if point (px, py) is within `radius` of the axis-aligned bbox."""
+    x1, y1, x2, y2 = bbox
+    cx = max(x1, min(px, x2))
+    cy = max(y1, min(py, y2))
+    return math.hypot(px - cx, py - cy) <= radius
+
+
+def _line_touches(line: Dict, shape: Dict, radius: float = _HIT_RADIUS) -> bool:
+    """
+    True if either endpoint of `line` is within `radius` of `shape`'s bbox.
+    Returns False (not True) when position/size data is missing, so this
+    check never produces false positives when geometry simply isn't present
+    in the payload — the name-based check still covers that case.
+    """
+    bbox = _geo_bbox(shape)
+    if bbox is None:
+        return False
+
+    start = _geo_pos(line)
+    if start is not None and _pt_near_bbox(start[0], start[1], bbox, radius):
+        return True
+
+    end = _geo_end_abs(line)
+    if end is not None and _pt_near_bbox(end[0], end[1], bbox, radius):
+        return True
+
+    return False
 
 
 def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
@@ -704,8 +652,9 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
                     "auto_fix": {"fixable": False},
                 })
 
-    # ── Connection checking ─────────────────────────────────────────────────
-    # Build connected sets from arrow shapes that have non-empty from/to fields.
+    # ── Connection checking (name-based + geometry-based) ──────────────────
+    # Method 1: name-based — arrow shapes that carry explicit from/to (or
+    # equivalent) fields naming the connected elements.
     connected = set()
     for s in shapes:
         t = s.get("type", "")
@@ -715,11 +664,37 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
                 if val:
                     connected.add(val)
 
-    # FIX: name-based fields ('from'/'to') are frequently absent — the app
-    # may only store line geometry (coordinates). Fall back to geometric
-    # proximity so real connections aren't missed just because there's no
-    # name field on the arrow.
-    connected |= _build_geometric_connections(shapes)
+    # Method 2: geometry-based (ported from usecase_validator.py) — a shape is
+    # "connected" if any line's endpoint (position / position+endPosition)
+    # lands within _HIT_RADIUS of that shape's bbox (position + size). This
+    # catches diagrams where lines are drawn visually touching a shape but
+    # don't carry explicit from/to name fields — the exact false-positive
+    # ("connected use case wrongly flagged as isolated") this was fixing.
+    # A shape only needs to satisfy ONE of the two methods to count as connected.
+    line_shapes = [s for s in shapes if _n(str(s.get("type", ""))) in _USECASE_LINE_TYPES]
+
+    if line_shapes:
+        for norm_name, orig_name in actors.items():
+            if norm_name in connected:
+                continue
+            shape = next(
+                (s for s in shapes if s.get("type") == "actor"
+                 and _n(_shape_name(s)) == norm_name),
+                None,
+            )
+            if shape and any(_line_touches(ln, shape) for ln in line_shapes):
+                connected.add(norm_name)
+
+        for norm_name, orig_name in use_cases.items():
+            if norm_name in connected:
+                continue
+            shape = next(
+                (s for s in shapes if s.get("type") == "use_case_oval"
+                 and _n(_shape_name(s)) == norm_name),
+                None,
+            )
+            if shape and any(_line_touches(ln, shape) for ln in line_shapes):
+                connected.add(norm_name)
 
     # DISCONNECTED_ACTOR: actor with no arrow connecting to any use case
     for norm_name, orig_name in actors.items():
@@ -759,137 +734,105 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ASSOCIATION LABEL GUESSER
-# Jab MISSING_ASSOCIATION_NAME error aaye, sirf "add a name" bolna kaafi nahi —
-# scenario text se khud guess karo ke kya likhna chahiye:
-#   - explicit phrases ("has a", "is a", "works for", "placed by",
-#     "reports to", "belongs to") seedha label ban jaate hain
-#   - modal verbs present-tense mein normalize hote hain
-#     ("can place" -> "places", "will manage" -> "manages")
-#   - 2 verbs ho to generic (is/are/has/have) ki bajaye specific wala verb
-#     prefer hota hai ("has" + "manages" -> "manages")
-#   - spaCy available ho to uska lemma nikal ke present-tense banate hain,
-#     warna fallback verb-list se
+# ASSOCIATION-NAME SUGGESTION — for class diagram MISSING_ASSOCIATION_NAME.
+# Scans the scenario text for the sentence connecting two class names and
+# suggests the actual verb/phrase that should be used as the label.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ASSOC_EXPLICIT_PHRASES = [
-    ("has a", "has a"), ("has an", "has a"), ("have a", "has a"), ("have an", "has a"),
-    ("is a", "is a"), ("is an", "is a"), ("are a", "is a"), ("are an", "is a"),
-    ("works for", "works for"), ("work for", "works for"),
-    ("placed by", "placed by"),
-    ("reports to", "reports to"), ("report to", "reports to"),
-    ("belongs to", "belongs to"), ("belong to", "belongs to"),
+_REL_LINK_PHRASES = [
+    "works for", "worked for", "placed by", "created by", "owned by",
+    "assigned to", "reports to", "belongs to", "consists of", "made up of",
+    "has a", "has an", "have a", "have an", "is a", "is an", "are a", "are an",
 ]
 
-_ASSOC_GENERIC_LEMMAS = {"is", "are", "was", "were", "be", "being", "been", "have", "has", "had"}
-
-_ASSOC_MODAL_RE = re.compile(r"^(?:can|could|may|might|shall|should|will|would|must)\s+(.+)$", re.I)
-
-_ASSOC_IRREGULAR_PRESENT = {"have": "has", "go": "goes", "do": "does", "be": "is"}
+_REL_MODAL_VERBS = {"can", "could", "may", "might", "must", "shall", "should", "will", "would"}
+_REL_IRREGULAR_PRESENT = {
+    "have": "has", "be": "is", "do": "does", "go": "goes",
+    "has": "has", "is": "is", "does": "does", "goes": "goes",
+}
 
 
 def _to_present_tense(verb: str) -> str:
-    """Convert a base-form verb to 3rd-person-singular present tense."""
-    v = (verb or "").lower().strip()
+    """Normalize a verb to lowercase, 3rd-person-singular present tense."""
+    v = verb.lower().strip()
     if not v:
         return v
-    if v in _ASSOC_IRREGULAR_PRESENT:
-        return _ASSOC_IRREGULAR_PRESENT[v]
-    if v.endswith("s") or v.endswith("ed") or v.endswith("ing"):
-        # Already looks conjugated/inflected somehow — leave it, rather than
-        # double-inflect (e.g. don't turn an already-present-tense "manages"
-        # into "manageses").
-        if v.endswith("s") and not v.endswith(("ss", "us")):
-            return v
+    if v in _REL_IRREGULAR_PRESENT:
+        return _REL_IRREGULAR_PRESENT[v]
+    if v in _REL_MODAL_VERBS:
+        return v
     if v.endswith("y") and len(v) > 1 and v[-2] not in "aeiou":
         return v[:-1] + "ies"
-    if v.endswith(("s", "x", "z", "ch", "sh", "o")):
+    if v.endswith(("s", "x", "z", "ch", "sh")):
         return v + "es"
-    return v + "s"
+    if v.endswith("e"):
+        return v + "s"          # place -> places, manage -> manages
+    return v + "s"               # work -> works, contain -> contains
 
 
-def _normalize_verb_phrase(phrase: str) -> str:
-    """Strip a leading modal ('can place' -> 'place') then present-tense it."""
-    phrase = (phrase or "").strip().lower()
-    m = _ASSOC_MODAL_RE.match(phrase)
-    if m:
-        phrase = m.group(1).strip()
-    words = phrase.split()
-    if not words:
-        return ""
-    if words[0] == "to" and len(words) > 1:
-        words = words[1:]
-    return _to_present_tense(words[0]) if words else ""
+def _name_variants(name: str) -> set:
+    n = name.lower().strip()
+    variants = {n}
+    if n.endswith("y") and len(n) > 1 and n[-2] not in "aeiou":
+        variants.add(n[:-1] + "ies")
+    else:
+        variants.add(n + "s")
+    if n.endswith("s"):
+        variants.add(n[:-1])
+    return variants
 
 
-def _guess_association_label(scenario: str, from_name: str, to_name: str) -> str:
+def _suggest_relationship_label(scenario: str, name_a: str, name_b: str) -> Optional[str]:
     """
-    Reverse-engineer the natural-language relationship label between two
-    classes from the scenario text, to suggest as an association name:
-      1. Explicit relationship phrases win outright ("has a", "is a",
-         "works for", "placed by", "reports to", "belongs to").
-      2. Otherwise pick the verb (via spaCy, or the fallback verb list)
-         connecting the two class names in a sentence that mentions both —
-         preferring a specific action verb over a generic linking verb
-         (is/are/has/have) when both appear.
-      3. Modal verbs are normalized to present tense
-         ("can place" -> "places", "will manage" -> "manages").
-    Returns "" if nothing can be confidently guessed (caller should fall
-    back to a generic suggestion in that case).
+    Find the sentence in `scenario` that mentions both `name_a` and `name_b`,
+    and suggest the verb/phrase connecting them as a lowercase, present-tense
+    association-name label.
+
+    Priority:
+      1. Known linking phrases ("has a", "works for", "placed by", ...) —
+         used verbatim as the label if present.
+      2. spaCy-tagged main verb between the two names (modal verbs like
+         "can"/"may" are skipped in favour of the actual action verb, and
+         the verb is normalized to present tense, e.g. "can place" -> "places").
+      3. Keyword-list fallback verb if spaCy isn't available.
+
+    Returns None if no relevant sentence / verb can be found — caller should
+    fall back to a generic suggestion in that case.
     """
-    if not scenario or not from_name or not to_name:
-        return ""
+    if not scenario or not name_a or not name_b:
+        return None
 
-    fn, tn = from_name.strip().lower(), to_name.strip().lower()
-    if not fn or not tn:
-        return ""
+    sentences = re.split(r"(?<=[.!?])\s+", scenario.strip())
+    va, vb = _name_variants(name_a), _name_variants(name_b)
 
-    sentences = re.split(r"(?<=[.!?])\s+", scenario)
-    candidate_sentences = [s for s in sentences if fn in s.lower() and tn in s.lower()]
-    if not candidate_sentences:
-        return ""
+    for sent in sentences:
+        s_low = sent.lower()
+        if not (any(x in s_low for x in va) and any(x in s_low for x in vb)):
+            continue
 
-    for sent in candidate_sentences:
-        low = sent.lower()
+        # 1) Known has-a / is-a / role phrases — use directly as the label
+        for phrase in _REL_LINK_PHRASES:
+            if phrase in s_low:
+                return phrase
 
-        # 1. Explicit phrases win outright — but only when `to_name` actually
-        # appears in the same clause right after the phrase, so a compound
-        # sentence like "Manager has a Department and manages Employees"
-        # doesn't leak the "has a" label onto the unrelated Manager→Employees
-        # pair (whose real relationship, "manages", is in the next clause).
-        for phrase, label in _ASSOC_EXPLICIT_PHRASES:
-            idx = low.find(phrase)
-            if idx == -1:
-                continue
-            after = low[idx + len(phrase):]
-            clause_breaks = [after.find(b) for b in (" and ", ", ", "; ") if after.find(b) != -1]
-            clause_end = min(clause_breaks) if clause_breaks else len(after)
-            if tn in after[:clause_end]:
-                return label
-
-        # 2. spaCy-based verb extraction (preferred — actual POS tagging)
+        # 2) spaCy main-verb extraction (skip modals/aux, prefer the last
+        #    substantive verb — i.e. the more specific one when 2 verbs exist)
         nlp = _get_pos_model()
         if nlp is not None:
             doc = nlp(sent)
             verbs = [t for t in doc if t.pos_ in ("VERB", "AUX")]
-            if verbs:
-                specific = [t for t in verbs if t.lemma_.lower() not in _ASSOC_GENERIC_LEMMAS]
-                chosen = specific[-1] if specific else verbs[-1]
-                label = _to_present_tense(chosen.lemma_.lower())
-                if label:
-                    return label
+            main_verbs = [t for t in verbs if t.lemma_.lower() not in _REL_MODAL_VERBS]
+            chosen = main_verbs[-1] if main_verbs else (verbs[-1] if verbs else None)
+            if chosen is not None:
+                return _to_present_tense(chosen.lemma_)
 
-        # 3. Keyword-list fallback (spaCy unavailable)
-        words = re.findall(r"[a-zA-Z']+", low)
-        found = [w for w in words if w in _FALLBACK_VERBS or w in _ASSOC_GENERIC_LEMMAS]
-        if found:
-            specific = [w for w in found if w not in _ASSOC_GENERIC_LEMMAS]
-            chosen = specific[-1] if specific else found[-1]
-            label = _to_present_tense(chosen)
-            if label:
-                return label
+        # 3) Fallback: scan words for a known action verb from the keyword list
+        words = re.findall(r"[a-zA-Z']+", s_low)
+        fallback_hits = [w for w in words if w in _FALLBACK_VERBS and w not in _REL_MODAL_VERBS]
+        if fallback_hits:
+            return _to_present_tense(fallback_hits[-1])
 
-    return ""
+    return None
 
 
 def _rule_check_class(shapes: List[Dict], scenario: str = "") -> List[Dict]:
@@ -1015,23 +958,30 @@ def _rule_check_class(shapes: List[Dict], scenario: str = "") -> List[Dict]:
                 if len(parts) >= 2:
                     label = parts[1].strip()
         if not label:
-            guessed = _guess_association_label(scenario, frm_disp, to_disp)
-            if guessed:
+            suggested = _suggest_relationship_label(scenario, frm_disp, to_disp)
+            if suggested:
                 errors.append({
                     "error_type": "MISSING_ASSOCIATION_NAME", "severity": "ERROR",
                     "element": f"{frm_disp} \u2192 {to_disp}",
                     "description": "Association Name is required",
-                    "suggestion": f"Add the label '{guessed}' at the midpoint of the line between '{frm_disp}' and '{to_disp}' (guessed from the scenario).",
+                    "suggestion": (
+                        f"Add '{suggested}' as the label at the midpoint of the line "
+                        f"between '{frm_disp}' and '{to_disp}' (based on the scenario)."
+                    ),
                     "auto_fix": {"fixable": True, "action": "add_label",
                                  "from_element": frm_disp, "to_element": to_disp,
-                                 "label": guessed},
+                                 "name": suggested},
                 })
             else:
                 errors.append({
                     "error_type": "MISSING_ASSOCIATION_NAME", "severity": "ERROR",
                     "element": f"{frm_disp} \u2192 {to_disp}",
                     "description": "Association Name is required",
-                    "suggestion": f"Add a name label at the midpoint of the line between '{frm_disp}' and '{to_disp}', e.g. a verb describing the relationship (e.g. 'manages', 'has a').",
+                    "suggestion": (
+                        f"Add a name label at the midpoint of the line between "
+                        f"'{frm_disp}' and '{to_disp}', e.g. a verb describing "
+                        f"their relationship (e.g. 'manages', 'has a')."
+                    ),
                     "auto_fix": {"fixable": False},
                 })
 
@@ -2093,7 +2043,7 @@ def validate_with_openai(
             }
             if not auto_fix["fixable"]:
                 auto_fix = _build_fallback_fix(
-                    str(e.get("error_type", "")), str(e.get("element", "")), e, diagram_type)
+                    str(e.get("error_type", "")), str(e.get("element", "")), e, diagram_type, scenario)
             item = {
                 "error_type":  str(e.get("error_type", "UNKNOWN")),
                 "severity":    sev,
@@ -2420,7 +2370,7 @@ def validate_with_openai_image(
                 element    = str(e.get("element",    ""))
 
                 if not auto_fix.get("fixable"):
-                    auto_fix = _build_fallback_fix(error_type, element, e, diagram_type)
+                    auto_fix = _build_fallback_fix(error_type, element, e, diagram_type, scenario)
 
                 item = {
                     "error_type":  error_type,
