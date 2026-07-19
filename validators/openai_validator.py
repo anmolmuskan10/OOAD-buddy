@@ -354,10 +354,98 @@ def _build_connection_map(shapes: List[Dict]) -> Dict[str, set]:
     return connections
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  POS tagging helper — used for accurate MISSING_NOUN / MISSING_VERB_IN_USE_CASE
+#  / ACTOR_SHOULD_BE_NOUN checks. Uses spaCy (already a project dependency,
+#  same model nlp_extractor.py loads) with a lazy, cached load so the model
+#  is only loaded once per process. Falls back to a keyword list if spaCy or
+#  the model isn't available, so these checks never hard-crash the request.
+# ─────────────────────────────────────────────────────────────────────────────
+_POS_MODEL = None
+_POS_MODEL_TRIED = False
+
+# Much larger fallback verb list than before (used only if spaCy unavailable).
+_FALLBACK_VERBS = {
+    "add","apply","approve","authenticate","authorize","browse","buy",
+    "calculate","cancel","change","check","close","complete","confirm",
+    "create","delete","display","download","edit","enter","export",
+    "filter","generate","get","handle","import","initiate","insert",
+    "launch","list","log","login","logout","make","manage","modify","monitor",
+    "notify","open","pay","perform","place","print","process","provide",
+    "purchase","read","receive","register","remove","request","reset",
+    "retrieve","review","save","search","select","send","set","show",
+    "sign","start","submit","track","update","upload","validate","verify",
+    "view","withdraw","write",
+    # ── previously missing verbs ──
+    "book","reserve","checkout","return","renew","borrow","assign","grant",
+    "deposit","transfer","order","ship","deliver","schedule","unlock","lock",
+    "compare","rate","share","invite","join","leave","subscribe",
+    "unsubscribe","publish","post","comment","like","follow","unfollow",
+    "block","report","finish","install","uninstall","configure","customize",
+    "sync","backup","restore","encrypt","decrypt","scan","fax","email",
+    "message","chat","call","record","pause","resume","stop","rewind",
+    "forward","upgrade","downgrade","activate","deactivate","enable","disable",
+    "redeem","refund","dispute","escalate","assign","allocate","withdraw",
+    "deposit","transfer","exchange","swap","merge","split","archive",
+    "restore","recover","terminate","suspend","resume","renew","extend",
+}
+
+
+def _get_pos_model():
+    """Lazily load & cache the spaCy model. Returns None if unavailable."""
+    global _POS_MODEL, _POS_MODEL_TRIED
+    if _POS_MODEL_TRIED:
+        return _POS_MODEL
+    _POS_MODEL_TRIED = True
+    try:
+        import spacy  # type: ignore
+        _POS_MODEL = spacy.load("en_core_web_sm")
+    except Exception as e:
+        _log.warning("POS model unavailable, falling back to verb keyword list: %s", e)
+        _POS_MODEL = None
+    return _POS_MODEL
+
+
+def _pos_analyze(name: str) -> Dict[str, bool]:
+    """
+    Analyze a shape name and return {'has_verb': bool, 'has_noun': bool}.
+    Uses real POS tagging when spaCy is available; otherwise falls back to
+    a keyword-list heuristic (still checks BOTH verb presence and noun
+    presence, unlike the old first-word-only check).
+    """
+    name = (name or "").strip()
+    if not name:
+        return {"has_verb": False, "has_noun": False}
+
+    nlp = _get_pos_model()
+    if nlp is not None:
+        doc = nlp(name)
+        has_verb = any(t.pos_ in ("VERB", "AUX") for t in doc)
+        has_noun = any(t.pos_ in ("NOUN", "PROPN") for t in doc)
+        return {"has_verb": has_verb, "has_noun": has_noun}
+
+    # ── Fallback: keyword-list heuristic ──
+    # spaCy unavailable — use a conservative convention-based heuristic instead
+    # of pure list-membership, since words like "order"/"report" can be BOTH
+    # noun and verb and a naive list lookup would misclassify "Manage Order".
+    words = [w.lower() for w in name.split()]
+    if not words:
+        return {"has_verb": False, "has_noun": False}
+    has_verb = words[0] in _FALLBACK_VERBS
+    if len(words) > 1:
+        # Standard UML naming convention is "Verb Noun" (e.g. "Manage Order") —
+        # trust that a second word is the object/noun.
+        has_noun = True
+    else:
+        has_noun = words[0] not in _FALLBACK_VERBS
+    return {"has_verb": has_verb, "has_noun": has_noun}
+
+
 def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
     """
     Deterministic rule-based checks for use case diagrams.
-    Handles: empty names, duplicates, disconnected actors/use-cases, capitalisation.
+    Handles: empty names, duplicates, disconnected actors/use-cases, capitalisation,
+    and noun/verb correctness (via spaCy POS tagging, with keyword-list fallback).
     Does NOT need LLM — all checks are from shape data directly.
     """
     errors = []
@@ -411,27 +499,30 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
             else:
                 use_cases[n] = name
 
-                # Check: use case name should start with a verb (action word)
-                # Common UML verbs list
-                _COMMON_VERBS = {
-                    "add","apply","approve","authenticate","authorize","browse","buy",
-                    "calculate","cancel","change","check","close","complete","confirm",
-                    "create","delete","display","download","edit","enter","export",
-                    "filter","generate","get","handle","import","initiate","insert",
-                    "launch","list","log","login","logout","make","manage","modify","monitor",
-                    "notify","open","pay","perform","place","print","process","provide",
-                    "purchase","read","receive","register","remove","request","reset",
-                    "retrieve","review","save","search","select","send","set","show",
-                    "sign","start","submit","track","update","upload","validate","verify",
-                    "view","withdraw","write",
-                }
-                first_word = name.strip().split()[0].lower() if name.strip() else ""
-                if first_word and first_word not in _COMMON_VERBS:
+                # ── Noun + Verb check (proper POS-based, catches BOTH directions) ──
+                _pos = _pos_analyze(name)
+                if _pos["has_verb"] and not _pos["has_noun"]:
+                    errors.append({
+                        "error_type": "MISSING_NOUN", "severity": "WARNING",
+                        "element": name,
+                        "description": f"Use case '{name}' has a verb but no noun/object — it's too vague.",
+                        "suggestion": f"Add an object to '{name}', e.g. '{name} Order' or '{name} Account'.",
+                        "auto_fix": {"fixable": False},
+                    })
+                elif _pos["has_noun"] and not _pos["has_verb"]:
                     errors.append({
                         "error_type": "MISSING_VERB_IN_USE_CASE", "severity": "WARNING",
                         "element": name,
-                        "description": f"Use case '{name}' does not start with an action verb.",
+                        "description": f"Use case '{name}' does not contain an action verb.",
                         "suggestion": f"Rename '{name}' to start with a verb, e.g. 'Manage {name}' or 'Process {name}'.",
+                        "auto_fix": {"fixable": True, "action": "rename_shape", "name": f"Manage {name}"},
+                    })
+                elif not _pos["has_verb"] and not _pos["has_noun"]:
+                    errors.append({
+                        "error_type": "MISSING_VERB_IN_USE_CASE", "severity": "WARNING",
+                        "element": name,
+                        "description": f"Use case '{name}' name is unclear — it should contain both an action verb and a noun.",
+                        "suggestion": f"Rename '{name}' to something like 'Manage {name}'.",
                         "auto_fix": {"fixable": True, "action": "rename_shape", "name": f"Manage {name}"},
                     })
 
@@ -483,26 +574,14 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
                 "auto_fix": {"fixable": False},
             })
 
-    # Check: actor names should be nouns (not start with a verb)
-    _COMMON_VERBS_ACTOR = {
-        "add","apply","approve","authenticate","authorize","browse","buy",
-        "calculate","cancel","change","check","close","complete","confirm",
-        "create","delete","display","download","edit","enter","export",
-        "filter","generate","get","handle","import","initiate","insert",
-        "launch","list","log","login","logout","manage","modify","monitor",
-        "notify","open","pay","perform","place","print","process","provide",
-        "purchase","read","receive","register","remove","request","reset",
-        "retrieve","review","save","search","select","send","set","show",
-        "sign","start","submit","track","update","upload","validate","verify",
-        "view","withdraw","write",
-    }
+    # Check: actor names should be nouns/roles, not verbs/actions (POS-based)
     for n, orig in actors.items():
-        first_word = orig.strip().split()[0].lower() if orig.strip() else ""
-        if first_word and first_word in _COMMON_VERBS_ACTOR:
+        _pos = _pos_analyze(orig)
+        if _pos["has_verb"] and not _pos["has_noun"]:
             errors.append({
                 "error_type": "ACTOR_SHOULD_BE_NOUN", "severity": "WARNING",
                 "element": orig,
-                "description": f"Actor '{orig}' appears to start with a verb. Actors should represent roles or entities (nouns), not actions.",
+                "description": f"Actor '{orig}' appears to be a verb/action. Actors should represent roles or entities (nouns), not actions.",
                 "suggestion": f"Rename '{orig}' to a role or entity name, e.g. 'Customer', 'Admin', or 'System'.",
                 "auto_fix": {"fixable": False},
             })
@@ -548,6 +627,99 @@ def _rule_check_class(shapes: List[Dict]) -> List[Dict]:
                     "suggestion": f"Rename '{name}' to '{correct}'.",
                     "auto_fix": {"fixable": True, "action": "rename_shape", "name": correct},
                 })
+    # ── Multiplicity + Association-Name checks (previously missing entirely) ──
+    # Every association/aggregation/composition arrow must have valid
+    # multiplicity on BOTH ends and a name label at its midpoint.
+    # Generalization/dependency/realization arrows are excluded — they never
+    # carry multiplicity or a name by UML convention.
+    _VALID_MULT_RE = re.compile(r"^(\d+|\*)(\.\.(\d+|\*))?$")
+    _NO_MULT_KEYWORDS = ("generalization", "inheritance", "extend", "realization",
+                         "dependency", "depend", "include")
+    _MULT_ARROW_KEYWORDS = ("association", "aggregation", "composition")
+
+    for s in shapes:
+        t = str(s.get("type", "")).lower()
+        if not any(k in t for k in _MULT_ARROW_KEYWORDS):
+            continue
+        if any(k in t for k in _NO_MULT_KEYWORDS):
+            continue
+
+        frm_raw = str(s.get("from") or "")
+        to_raw  = str(s.get("to")   or "")
+        frm_n, to_n = _n(frm_raw), _n(to_raw)
+        if not frm_n or not to_n:
+            continue  # can't identify endpoints — skip rather than guess
+
+        frm_disp = class_names.get(frm_n, frm_raw)
+        to_disp  = class_names.get(to_n,  to_raw)
+
+        m_start = str(s.get("multiplicity_start") or "").strip()
+        m_end   = str(s.get("multiplicity_end")   or "").strip()
+
+        # ── MISSING_MULTIPLICITY ──
+        if not m_start and not m_end:
+            errors.append({
+                "error_type": "MISSING_MULTIPLICITY", "severity": "ERROR",
+                "element": f"{frm_disp} \u2192 {to_disp}",
+                "description": f"Relationship '{frm_disp}' \u2192 '{to_disp}' is missing multiplicity on both ends.",
+                "suggestion": "Add multiplicity labels (e.g., '1', '0..*', '1..*') on both sides of the relationship.",
+                "auto_fix": {"fixable": True, "action": "update_multiplicity",
+                             "from_element": frm_disp, "to_element": to_disp,
+                             "multiplicity_from": "1", "multiplicity_to": "*"},
+            })
+        elif not m_start:
+            errors.append({
+                "error_type": "MISSING_MULTIPLICITY", "severity": "ERROR",
+                "element": f"{frm_disp} \u2192 {to_disp}",
+                "description": f"Relationship '{frm_disp}' \u2192 '{to_disp}' is missing multiplicity on the '{frm_disp}' side.",
+                "suggestion": f"Add a multiplicity label (e.g., '1', '0..*') on the '{frm_disp}' side.",
+                "auto_fix": {"fixable": True, "action": "update_multiplicity",
+                             "from_element": frm_disp, "to_element": to_disp,
+                             "multiplicity_from": "1", "multiplicity_to": m_end},
+            })
+        elif not m_end:
+            errors.append({
+                "error_type": "MISSING_MULTIPLICITY", "severity": "ERROR",
+                "element": f"{frm_disp} \u2192 {to_disp}",
+                "description": f"Relationship '{frm_disp}' \u2192 '{to_disp}' is missing multiplicity on the '{to_disp}' side.",
+                "suggestion": f"Add a multiplicity label (e.g., '1', '0..*') on the '{to_disp}' side.",
+                "auto_fix": {"fixable": True, "action": "update_multiplicity",
+                             "from_element": frm_disp, "to_element": to_disp,
+                             "multiplicity_from": m_start, "multiplicity_to": "*"},
+            })
+        else:
+            # ── INVALID_MULTIPLICITY — both present but format is malformed ──
+            bad_start = not _VALID_MULT_RE.match(m_start)
+            bad_end   = not _VALID_MULT_RE.match(m_end)
+            if bad_start or bad_end:
+                bad_side = frm_disp if bad_start else to_disp
+                bad_val  = m_start if bad_start else m_end
+                errors.append({
+                    "error_type": "INVALID_MULTIPLICITY", "severity": "ERROR",
+                    "element": f"{frm_disp} \u2192 {to_disp}",
+                    "description": (f"Multiplicity '{bad_val}' on the '{bad_side}' side of "
+                                     f"'{frm_disp}' \u2192 '{to_disp}' is not a valid UML multiplicity."),
+                    "suggestion": "Use a valid format such as '1', '0..1', '*', '0..*', or '1..*'.",
+                    "auto_fix": {"fixable": False},
+                })
+
+        # ── MISSING_ASSOCIATION_NAME — unconditional, independent of multiplicity ──
+        label = str(s.get("relationship_label") or "").strip()
+        if not label:
+            text = str(s.get("text") or "").strip()
+            if "|" in text:
+                parts = text.split("|")
+                if len(parts) >= 2:
+                    label = parts[1].strip()
+        if not label:
+            errors.append({
+                "error_type": "MISSING_ASSOCIATION_NAME", "severity": "ERROR",
+                "element": f"{frm_disp} \u2192 {to_disp}",
+                "description": "Association Name is required",
+                "suggestion": f"Add a name label at the midpoint of the line between '{frm_disp}' and '{to_disp}'.",
+                "auto_fix": {"fixable": False},
+            })
+
     return errors
 
 
@@ -699,6 +871,9 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
         "unlabelled_actor", "unlabelled_use_case", "unlabelled_lifeline",
         "empty_class_name",
         "disconnected_actor", "isolated_use_case",  # handled by rule engine above
+        "missing_multiplicity", "invalid_multiplicity",  # handled by rule engine above
+        "missing_association_name",  # handled by rule engine above
+        "missing_noun",  # handled by rule engine above
         # Self-referential / actor-connection hallucinations
         "self_referential_relationship", "incorrect_self_referential_relationship",
         "self_referential", "incorrect_self_reference",
