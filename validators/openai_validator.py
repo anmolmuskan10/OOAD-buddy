@@ -427,43 +427,29 @@ def _get_pos_model():
 def _pos_analyze(name: str) -> Dict[str, bool]:
     """
     Analyze a shape name and return {'has_verb': bool, 'has_noun': bool}.
-    Combines real POS tagging (when spaCy is available) WITH the keyword-list
-    / word-position heuristic, instead of relying on spaCy alone.
-
-    Why: spaCy's tagger is trained on full sentences. Short, context-free,
-    imperative UML use-case labels like "Track Order" or "Book Room" are
-    frequently mistagged (e.g. "Track"/"Book" tagged as NOUN instead of VERB),
-    which was causing CORRECT "Verb + Noun" names to be wrongly flagged as
-    missing a verb or noun. To avoid these false positives, a word that is a
-    known action verb (first word, from _FALLBACK_VERBS) or that follows the
-    standard UML "Verb Noun" convention (a second word = the object/noun) is
-    always honoured, in addition to whatever spaCy detects.
+    Uses real POS tagging when spaCy is available; otherwise falls back to
+    a keyword-list heuristic (still checks BOTH verb presence and noun
+    presence, unlike the old first-word-only check).
     """
     name = (name or "").strip()
     if not name:
         return {"has_verb": False, "has_noun": False}
 
-    words = [w.lower() for w in name.split()]
-    known_verb = bool(words) and words[0] in _FALLBACK_VERBS
-
     nlp = _get_pos_model()
     if nlp is not None:
         doc = nlp(name)
-        has_verb = any(t.pos_ in ("VERB", "AUX") for t in doc) or known_verb
-        has_noun = (
-            any(t.pos_ in ("NOUN", "PROPN") for t in doc)
-            or (len(words) > 1)          # 2nd+ word = object/noun by convention
-            or (len(words) == 1 and not known_verb)
-        )
+        has_verb = any(t.pos_ in ("VERB", "AUX") for t in doc)
+        has_noun = any(t.pos_ in ("NOUN", "PROPN") for t in doc)
         return {"has_verb": has_verb, "has_noun": has_noun}
 
-    # ── Fallback: keyword-list heuristic (spaCy unavailable) ──
+    # ── Fallback: keyword-list heuristic ──
     # spaCy unavailable — use a conservative convention-based heuristic instead
     # of pure list-membership, since words like "order"/"report" can be BOTH
     # noun and verb and a naive list lookup would misclassify "Manage Order".
+    words = [w.lower() for w in name.split()]
     if not words:
         return {"has_verb": False, "has_noun": False}
-    has_verb = known_verb
+    has_verb = words[0] in _FALLBACK_VERBS
     if len(words) > 1:
         # Standard UML naming convention is "Verb Noun" (e.g. "Manage Order") —
         # trust that a second word is the object/noun.
@@ -471,7 +457,6 @@ def _pos_analyze(name: str) -> Dict[str, bool]:
     else:
         has_noun = words[0] not in _FALLBACK_VERBS
     return {"has_verb": has_verb, "has_noun": has_noun}
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -634,7 +619,7 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
                     errors.append({
                         "error_type": "MISSING_VERB_IN_USE_CASE", "severity": "WARNING",
                         "element": name,
-                        "description": f"Use case '{name}' must follow the 'Verb + Noun' naming format (e.g. 'Manage Order', 'Place Order').",
+                        "description": f"Use case '{name}' must follow the 'Verb + Noun' naming format only (e.g. 'Manage Order', 'Place Order') — a verb followed by a noun, nothing more.",
                         "suggestion": f"Rename '{name}' to a verb + noun, e.g. 'Manage {name}' or 'Process {name}'.",
                         "auto_fix": {"fixable": True, "action": "rename_shape", "name": f"Manage {name}"},
                     })
@@ -1409,6 +1394,7 @@ Examples of semantically equivalent descriptions:
 12. EMPTY_CLASS_NAME          — Class has no name or placeholder like "Class 1".
 13. SELF_ASSOCIATION          — Class connected to itself (warn unless scenario says so).
 14. SPELLING_MISTAKE          — A class name closely resembles a scenario class name but is misspelled (e.g. "Custmer" instead of "Customer"). ONE error only — do NOT also report MISSING_CLASS or EXTRA_CLASS for the same element.
+15. WRONG_ASSOCIATION_LABEL   — An association/aggregation/composition arrow HAS a label, but that label does not match what the scenario describes for that relationship. ALWAYS include the correct word/phrase taken directly from the scenario in the "suggestion" field.
 
 ## SEVERITY
 ERROR = must fix | WARNING = should fix | INFO = suggestion
@@ -1435,6 +1421,7 @@ AUTO-FIX RULES:
 - MISSING_MULTIPLICITY → fixable: true, action: add_label, from_element, to_element, multiplicity_from, multiplicity_to
 - WRONG_MULTIPLICITY → fixable: true, action: add_label, from_element, to_element, multiplicity_from: <correct>, multiplicity_to: <correct>
 - MISSING_ASSOCIATION_LABEL → fixable: true, action: add_label, from_element, to_element, name: <label>
+- WRONG_ASSOCIATION_LABEL → fixable: true, action: add_label, from_element, to_element, name: <correct label from scenario>
 - WRONG_INHERITANCE_DIRECTION → fixable: false
 - CIRCULAR_INHERITANCE → fixable: false
 - EXTRA_CLASS → fixable: false
@@ -1529,6 +1516,7 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - Example: scenario says "Bank manages Customer" but arrow label says "owns" → WRONG_ASSOCIATION_LABEL.
 - Example: scenario says "Teacher teaches Student" but arrow label says "trains" → WRONG_ASSOCIATION_LABEL.
 - description: "Label 'X' on arrow ClassA → ClassB should be 'Y' based on scenario."
+- suggestion: ALWAYS state the exact correct word/phrase from the scenario, e.g. "Change label 'X' to 'Y' as described in the scenario."
 - auto_fix: fixable: true, action: add_label, from_element: "ClassA", to_element: "ClassB", label: "<correct label>"
 - STRICT: Only report when scenario explicitly names the relationship AND drawn label is clearly different.
 - STRICT: Minor variations (e.g. "manage" vs "manages") are acceptable — do NOT report.
@@ -2107,10 +2095,11 @@ def _build_image_prompt(diagram_type: str, scenario: str) -> str:
 7. MISSING_SYSTEM_BOUNDARY — System boundary box is entirely absent. Only report if you CANNOT SEE any rectangle/box enclosing use cases.
 8. WRONG_SYSTEM_BOUNDARY_NAME — Boundary EXISTS but its label doesn't match scenario system name. Say "change name from X to Y" — never say "add a new boundary".
 9. WRONG_RELATIONSHIP — include/extend/generalization used incorrectly.
-10. MISSING_VERB_IN_USE_CASE — Use case name missing action verb.
+10. MISSING_VERB_IN_USE_CASE — Use case oval label must follow the 'Verb + Noun' format ONLY — a single action verb followed by a single noun/object (e.g. "Manage Order", "Place Order", "Browse Products"). Flag this if the label is missing a verb, missing a noun, or has extra words beyond verb + noun.
 11. DUPLICATE_ACTOR — Same actor name appears twice.
 12. DUPLICATE_USE_CASE — Same use case name appears twice.
 13. SPELLING_MISTAKE   — An actor or use case name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_ACTOR/MISSING_USE_CASE or EXTRA_ACTOR/EXTRA_USE_CASE for the same element.
+14. WRONG_ACTOR_NAME — Actor names must be nouns/roles (e.g. "Customer", "Admin", "Bank", "System"), never verbs/actions (e.g. "Login", "Register", "Manage", "Browse", "Pay"). Flag any actor whose label is a verb/action.
 CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisation as missing/extra."""
         dtype_label = "USE CASE"
         extra_rules = """
@@ -2122,7 +2111,19 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 ## SYSTEM BOUNDARY NAME RULE:
 - If boundary EXISTS with wrong name → report WRONG_SYSTEM_BOUNDARY_NAME, suggest renaming.
 - If boundary does NOT exist → report MISSING_SYSTEM_BOUNDARY.
-- Never report both for the same diagram."""
+- Never report both for the same diagram.
+
+## USE CASE NAMING FORMAT RULE — CRITICAL:
+- A valid use case label is EXACTLY "Verb + Noun" — two parts only (e.g. "Manage Order").
+- Do NOT require or expect a third word or a trailing verb. "Verb + Noun + Verb" is NOT the rule.
+- If the label has only a verb, only a noun, or more than a verb+noun pair, report MISSING_VERB_IN_USE_CASE.
+- suggestion: "Rename 'X' to a verb + noun, e.g. 'Manage X' or 'Process X'."
+
+## ACTOR NAME FORMAT RULE — CRITICAL:
+- Actor labels must be nouns/roles, never verbs/actions.
+- If an actor label is a verb/action → report WRONG_ACTOR_NAME as WARNING.
+- description: "Actor names must represent roles or entities, not actions."
+- suggestion: "Rename actor to a proper role name like 'Customer' or 'Admin'." """
 
     elif "sequence" in dt:
         rules = """1. MISSING_LIFELINE — Every participant in scenario must have a lifeline or object box.
@@ -2165,7 +2166,8 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 11. CIRCULAR_INHERITANCE      — A inherits B and B inherits A.
 12. EMPTY_CLASS_NAME          — Class has no name or placeholder like "Class 1".
 13. SELF_ASSOCIATION          — Class connected to itself (warn unless scenario says so).
-14. SPELLING_MISTAKE          — A class name closely resembles a scenario class name but is misspelled (e.g. "Custmer" instead of "Customer"). ONE error only — do NOT also report MISSING_CLASS or EXTRA_CLASS for the same element."""
+14. SPELLING_MISTAKE          — A class name closely resembles a scenario class name but is misspelled (e.g. "Custmer" instead of "Customer"). ONE error only — do NOT also report MISSING_CLASS or EXTRA_CLASS for the same element.
+15. WRONG_ASSOCIATION_LABEL   — An association/aggregation/composition arrow HAS a visible label, but that label does not match what the scenario describes for that relationship. ALWAYS include the correct word/phrase taken directly from the scenario in the "suggestion" field."""
         dtype_label = "CLASS"
         extra_rules = """
 ## RELATIONSHIP TYPE VALIDATION:
@@ -2191,6 +2193,13 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 ## MISSING LABEL RULE:
 - Only report MISSING_ASSOCIATION_LABEL if scenario names what the relationship should be called.
 - If scenario does not name the relationship → labels are optional.
+
+## WRONG ASSOCIATION LABEL RULE — CRITICAL:
+- Check every association/aggregation/composition arrow that HAS a visible label.
+- If the drawn label does NOT match what the scenario describes for that relationship → report WRONG_ASSOCIATION_LABEL as a WARNING.
+- Example: scenario says "Bank manages Customer" but arrow label reads "owns" → WRONG_ASSOCIATION_LABEL.
+- suggestion: ALWAYS name the exact correct word/phrase from the scenario, e.g. "Change label 'owns' to 'manages' as described in the scenario."
+- Minor wording variations (e.g. "manage" vs "manages") are acceptable — do NOT report those.
 
 ## MULTIPLICITY RULES:
 - If a multiplicity value is visible at EITHER end of an association/aggregation/composition arrow → multiplicity EXISTS, do NOT report MISSING_MULTIPLICITY.
@@ -2248,6 +2257,9 @@ For each error, provide an "auto_fix" object. Set "fixable": true only for these
 - SPELLING_MISTAKE → action: "rename_shape", name: <correct spelling from scenario>, fixable: true
 - DISCONNECTED_ACTOR / ISOLATED_USE_CASE → action: "add_arrow", from_element, to_element, arrow_type: "association"
 - MISSING_MULTIPLICITY → action: "add_label", from_element, to_element, multiplicity_from, multiplicity_to
+- MISSING_VERB_IN_USE_CASE → action: "rename_shape", name: <corrected name with verb + noun only>, fixable: true
+- WRONG_ASSOCIATION_LABEL → action: "add_label", from_element, to_element, label: <correct label from scenario>, fixable: true
+- WRONG_ACTOR_NAME → fixable: false
 All other errors → fixable: false
 
 ## RESPONSE FORMAT (JSON only, no markdown)
