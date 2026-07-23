@@ -1151,7 +1151,8 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
         "disconnected_actor", "isolated_use_case",  # handled by rule engine above
         "missing_multiplicity", "invalid_multiplicity",  # handled by rule engine above
         "missing_association_name",  # handled by rule engine above
-        "missing_noun",  # handled by rule engine above
+        "missing_noun",  # handled by ru
+        "extra_use_case",  # disabled — causes false positives in canvas validationle engine above
         # Self-referential / actor-connection hallucinations
         "self_referential_relationship", "incorrect_self_referential_relationship",
         "self_referential", "incorrect_self_reference",
@@ -1579,7 +1580,17 @@ checking is done by a separate rule-based system — do NOT repeat those checks.
 2. MISSING_USE_CASE   — A use case explicitly named in the scenario is completely absent from the diagram.
                         Match case-insensitively. If "Login" is in scenario and "login" is in diagram → NOT missing.
 3. EXTRA_ACTOR        — Actor in diagram not mentioned in scenario at all (WARNING only).
+                        STRICT: Only report if actor name has ZERO semantic connection to scenario.
+                        If actor name is a role that could reasonably exist in the system → NOT extra.
+                        When in doubt → DO NOT report EXTRA_ACTOR.
 4. EXTRA_USE_CASE     — Use case in diagram not mentioned in scenario at all (INFO only).
+                        STRICT: Only report if use case has ZERO semantic connection to ANY word in scenario.
+                        If use case is a reasonable sub-function or synonym of scenario action → NOT extra.
+                        When in doubt → DO NOT report EXTRA_USE_CASE.
+                        CRITICAL: Do NOT report EXTRA_USE_CASE if the use case name is a reasonable
+                        variation, abbreviation, or synonym of anything in the scenario.
+                        Example: scenario has "manage shopping cart" → "manage cart" is NOT extra.
+                        Example: scenario has "make payments" → "payment" or "pay" is NOT extra.
 5. MISSING_SYSTEM_BOUNDARY — No system boundary rectangle exists in the diagram at all.
 6. WRONG_SYSTEM_BOUNDARY_NAME — Boundary exists but label does not match scenario system name.
 7. WRONG_RELATIONSHIP — include/extend/generalization used incorrectly per scenario.
@@ -1589,6 +1600,8 @@ DO NOT CHECK AND DO NOT REPORT:
 - DISCONNECTED_ACTOR (handled by rule system)
 - ISOLATED_USE_CASE (handled by rule system)
 - UNLABELLED_USE_CASE (handled by rule system)
+- EXTRA_USE_CASE — do NOT report this. It causes too many false positives in canvas validation.
+  If a use case seems extra, silently ignore it. Under-reporting is always better than false positives.
 - WRONG_ACTOR_NAME / actor-noun checks (handled by rule system — do NOT report this yourself, it is unreliable from an image/shape read and duplicates the rule engine)
 - DUPLICATE_ACTOR / DUPLICATE_USE_CASE (handled by rule system)
 - UNLABELLED_ACTOR / UNLABELLED_USE_CASE (handled by rule system)
