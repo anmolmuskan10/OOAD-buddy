@@ -177,8 +177,15 @@ def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
             val = s.get(field)
             if val is not None and str(val).strip().lower() not in ("", "none", "null", "undefined"):
                 # classFullShape text = "ClassName\n---attrs---\n..." — preserve full text for class shapes
-                # but send only class name for the "name" equivalent
-                if field == "text" and "\n" in str(val):
+                # but send only class name for the "name" equivalent.
+                # IMPORTANT: this special-casing is ONLY valid for actual class-box
+                # shapes. Any other shape (use case oval, actor, etc.) can also end
+                # up with a "\n" in its text simply because the canvas UI wraps a
+                # long label onto two lines — splitting on that "\n" would truncate
+                # a real label (e.g. "manage shopping cart" → "manage") and send a
+                # misleading extra "_class_name" field, causing the LLM to think
+                # the label doesn't match the scenario (false EXTRA_USE_CASE, etc).
+                if field == "text" and clean_t == "class" and "\n" in str(val):
                     # Keep full text so LLM can see attributes/methods
                     entry[field] = val
                     # Also expose the class name separately
