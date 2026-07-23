@@ -1132,10 +1132,45 @@ def _existing_names(shapes: List[Dict]) -> set:
     return names
 
 
+_STOPWORDS = {
+    "a", "an", "the", "of", "to", "for", "and", "or", "in", "on", "at",
+    "by", "with", "is", "are", "be", "will", "can", "should", "must",
+    "their", "his", "her", "its", "system", "user",
+}
+
+
+def _stem(w: str) -> str:
+    """Very light stemmer so 'tracks'/'tracking'/'tracked' all match 'track'."""
+    w = w.lower()
+    for suf in ("ing", "ed", "es", "s"):
+        if w.endswith(suf) and len(w) - len(suf) >= 3:
+            return w[: -len(suf)]
+    return w
+
+
+def _scenario_mentions(scenario: str, element: str) -> bool:
+    """
+    Fuzzy, deterministic check: does the scenario text actually contain
+    (a close variant of) this element name? Used to stop the LLM from
+    reporting EXTRA_USE_CASE / EXTRA_ACTOR for things that ARE in the
+    scenario just written with different wording/case/tense.
+    """
+    if not scenario or not element:
+        return False
+    scenario_words = {_stem(w) for w in re.findall(r"[a-zA-Z]+", scenario)}
+    elem_words = [w for w in re.findall(r"[a-zA-Z]+", element) if _n(w) not in _STOPWORDS]
+    if not elem_words:
+        return False
+    matched = sum(1 for w in elem_words if _stem(w) in scenario_words)
+    # Majority of the significant words must appear in the scenario text.
+    return matched >= max(1, math.ceil(len(elem_words) / 2))
+
+
 def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
                    llm_warnings: List[Dict], llm_info: List[Dict],
                    clean_shapes: List[Dict], llm_score: int, llm_summary: str,
-                   ignored_errors: Optional[List[str]] = None) -> Dict:
+                   ignored_errors: Optional[List[str]] = None,
+                   scenario: str = "") -> Dict:
     """
     Merge rule-based errors with LLM errors.
     - Rule errors: always trusted (deterministic).
@@ -1211,6 +1246,18 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
             if len(names_found) >= 2:
                 if _n(names_found[0]) == _n(names_found[1]):
                     return False  # same name, just different case — not a real error
+
+        # Drop EXTRA_USE_CASE / EXTRA_ACTOR (and MISSING_USE_CASE / MISSING_ACTOR)
+        # if a deterministic fuzzy word-match shows the element name IS actually
+        # present in the scenario text — this is a pure LLM hallucination guard,
+        # independent of the model's own (sometimes wrong) judgement.
+        if et in ("extra_use_case", "extra_actor") and elem:
+            if _scenario_mentions(scenario, e.get("element", "")):
+                return False
+
+        if et in ("missing_use_case", "missing_actor") and elem:
+            if _scenario_mentions(scenario, e.get("element", "")) and elem in existing:
+                return False
 
         # Drop if LLM says element is MISSING but it exists in shapes (hallucination)
         if "missing" in et and elem and elem in existing:
@@ -2079,6 +2126,7 @@ def validate_with_openai(
             int(result.get("score", 50)),
             result.get("summary", ""),
             _ignored,
+            scenario,
         )
 
     # LLM failed — return rule-only results
