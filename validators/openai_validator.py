@@ -408,6 +408,27 @@ _FALLBACK_VERBS = {
     "restore","recover","terminate","suspend","resume","renew","extend",
 }
 
+# Common actor/role nouns that must NEVER be flagged as verbs, even if a POS
+# tagger mistags a bare standalone word (spaCy has no sentence context for a
+# single shape label and sometimes guesses VERB for short unknown words like
+# "admin"). This whitelist always wins over the tagger's guess.
+_COMMON_ROLE_NOUNS = {
+    "admin", "administrator", "customer", "user", "client", "manager",
+    "system", "bank", "employee", "staff", "guest", "visitor", "operator",
+    "supervisor", "student", "teacher", "instructor", "vendor", "supplier",
+    "seller", "buyer", "member", "moderator", "owner", "driver", "rider",
+    "passenger", "doctor", "nurse", "patient", "librarian", "cashier",
+    "auditor", "agent", "clerk", "receptionist", "technician", "engineer",
+    "developer", "analyst", "director", "president", "ceo", "hr",
+    "accountant", "warehouse", "merchant", "shopkeeper", "tenant",
+    "landlord", "guardian", "parent", "child", "applicant", "recruiter",
+    "payment gateway", "third party", "external system",
+}
+
+
+def _is_known_role_noun(name: str) -> bool:
+    return (name or "").strip().lower() in _COMMON_ROLE_NOUNS
+
 
 def _get_pos_model():
     """Lazily load & cache the spaCy model. Returns None if unavailable."""
@@ -434,6 +455,11 @@ def _pos_analyze(name: str) -> Dict[str, bool]:
     name = (name or "").strip()
     if not name:
         return {"has_verb": False, "has_noun": False}
+
+    # Safety override: known role/entity nouns are never verbs, regardless
+    # of what the POS tagger guesses for a bare standalone word.
+    if _is_known_role_noun(name):
+        return {"has_verb": False, "has_noun": True}
 
     nlp = _get_pos_model()
     if nlp is not None:
@@ -1563,16 +1589,7 @@ DO NOT CHECK AND DO NOT REPORT:
 - DISCONNECTED_ACTOR (handled by rule system)
 - ISOLATED_USE_CASE (handled by rule system)
 - UNLABELLED_USE_CASE (handled by rule system)
-
-### WRONG_ACTOR_NAME / MISSING_NOUN (actor name must be a noun/role):
-- Check EVERY actor shape in the diagram.
-- Actor names MUST be nouns/roles (e.g. "Customer", "Admin", "Bank", "System", "User").
-- If actor name is a VERB or action (e.g. "Login", "Register", "Manage", "Browse", "Pay") → report WRONG_ACTOR_NAME as WARNING.
-- If actor name is completely wrong or unrelated to scenario → report WRONG_ACTOR_NAME as WARNING.
-- description: "Actor names must represent roles or entities, not actions."
-- suggestion: "Rename actor to a proper role name like 'Customer' or 'Admin'."
-- auto_fix: fixable: false
-- STRICT: Check ALL actors without exception.
+- WRONG_ACTOR_NAME / actor-noun checks (handled by rule system — do NOT report this yourself, it is unreliable from an image/shape read and duplicates the rule engine)
 - DUPLICATE_ACTOR / DUPLICATE_USE_CASE (handled by rule system)
 - UNLABELLED_ACTOR / UNLABELLED_USE_CASE (handled by rule system)
 - Any capitalisation errors — case differences are NEVER errors
@@ -1580,6 +1597,15 @@ DO NOT CHECK AND DO NOT REPORT:
 - INCORRECT_RELATIONSHIP between two actors — actor-to-actor relationships are NEVER an error in use case diagrams
 - INCORRECT_RELATIONSHIP or INVALID_RELATIONSHIP of any kind — these error types do not exist in use case diagrams
 - WRONG_MULTIPLICITY — multiplicity does not apply to use case diagrams
+
+## SEMANTIC MATCHING — CRITICAL, AVOID FALSE POSITIVES
+- Before reporting MISSING_USE_CASE, MISSING_ACTOR, EXTRA_USE_CASE, or EXTRA_ACTOR, compare meaning, not just exact words.
+- "Manage Products" ≈ "Add Product" / "Edit Product" / "Browse Products" if the scenario describes that capability in different wording — treat as a MATCH, not missing/extra.
+- Synonyms count as matches: "Place Order" ≈ "Order Product", "Make Payment" ≈ "Pay", "Track Deliveries" ≈ "Track Delivery" ≈ "View Delivery Status".
+- Singular/plural differences are NEVER errors: "Product" == "Products".
+- Only report MISSING_USE_CASE/MISSING_ACTOR if the scenario clearly describes a capability/role that has NO reasonable equivalent anywhere in the diagram.
+- Only report EXTRA_USE_CASE/EXTRA_ACTOR if the diagram element has NO reasonable connection to anything described in the scenario.
+- If you are not confident an element is truly missing or truly extra, DO NOT report it — under-reporting is better than a false positive.
 
 ## CASE-INSENSITIVE MATCHING — ABSOLUTE RULE
 - ALL name matching is 100% CASE-INSENSITIVE.
