@@ -119,27 +119,7 @@ def _clean_type(raw_type: str) -> str:
     if "." in t:
         t = t.split(".")[-1]            # 'ToolType.classFullShape' → 'classfullshape'
     t = re.sub(r"[_\-]", "", t)        # drop separators before lookup
-    if t in _TOOLTYPE_MAP:
-        return _TOOLTYPE_MAP[t]
-
-    # ── FALLBACK: keyword-based classification ─────────────────────────────
-    # _TOOLTYPE_MAP only knows exact ToolType strings. If the frontend ever
-    # sends a variant we haven't enumerated (e.g. "oval", "ellipse",
-    # "useCaseShape", "actorShape", "boundaryShape"), the strict lookup above
-    # would leave it unrecognised — and _sanitize_shapes() would then SILENTLY
-    # DROP it (since it matches no _VALID_TYPES_BY_DIAGRAM entry), making a
-    # real use case/actor invisible to the LLM and causing false
-    # MISSING_USE_CASE / MISSING_ACTOR reports on an otherwise-correct canvas
-    # diagram. Loosely classify by keyword instead of dropping silently.
-    if "usecase" in t or "oval" in t or "ellipse" in t:
-        return "use_case_oval"
-    if "actor" in t:
-        return "actor"
-    if "boundary" in t:
-        return "system_boundary"
-    if "lifeline" in t and "object" not in t:
-        return "lifeline"
-    return t
+    return _TOOLTYPE_MAP.get(t, t)
 
 
 def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
@@ -159,12 +139,6 @@ def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
         if valid_types and clean_t not in valid_types:
             has_conn = any(s.get(f) for f in ("from", "to", "startLifeline", "endLifeline"))
             if not has_conn:
-                _log.warning(
-                    "Sanitizer dropped shape (raw_type=%r → clean_type=%r) not valid for "
-                    "diagram_type=%r — if this shape SHOULD exist in this diagram, add its "
-                    "raw type to _TOOLTYPE_MAP / the keyword fallback in _clean_type().",
-                    s.get("type", ""), clean_t, diagram_type,
-                )
                 continue  # skip this shape — it doesn't belong here
 
         # Build a minimal, clean dict for Gemini
@@ -177,15 +151,8 @@ def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
             val = s.get(field)
             if val is not None and str(val).strip().lower() not in ("", "none", "null", "undefined"):
                 # classFullShape text = "ClassName\n---attrs---\n..." — preserve full text for class shapes
-                # but send only class name for the "name" equivalent.
-                # IMPORTANT: this special-casing is ONLY valid for actual class-box
-                # shapes. Any other shape (use case oval, actor, etc.) can also end
-                # up with a "\n" in its text simply because the canvas UI wraps a
-                # long label onto two lines — splitting on that "\n" would truncate
-                # a real label (e.g. "manage shopping cart" → "manage") and send a
-                # misleading extra "_class_name" field, causing the LLM to think
-                # the label doesn't match the scenario (false EXTRA_USE_CASE, etc).
-                if field == "text" and clean_t == "class" and "\n" in str(val):
+                # but send only class name for the "name" equivalent
+                if field == "text" and "\n" in str(val):
                     # Keep full text so LLM can see attributes/methods
                     entry[field] = val
                     # Also expose the class name separately
@@ -1247,6 +1214,14 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
 
         # Drop if LLM says element is MISSING but it exists in shapes (hallucination)
         if "missing" in et and elem and elem in existing:
+            # MISSING_USE_CASE and MISSING_ACTOR: never filter based on name-in-existing.
+            # The shape existing in the diagram is exactly why `existing` contains its name —
+            # but GPT may legitimately flag it missing for semantic reasons (wrong label,
+            # not matching the scenario, disconnected context, etc.).
+            # Filtering these out causes correct GPT errors to be silently dropped.
+            if et in ("missing_use_case", "missing_actor"):
+                return True
+
             # Allow MISSING_MULTIPLICITY / MISSING_RELATIONSHIP even if element name matches
             # ONLY if the relationship itself is NOT already in the diagram
             if et in ("missing_multiplicity", "missing_relationship",
