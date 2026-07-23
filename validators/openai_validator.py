@@ -119,27 +119,7 @@ def _clean_type(raw_type: str) -> str:
     if "." in t:
         t = t.split(".")[-1]            # 'ToolType.classFullShape' → 'classfullshape'
     t = re.sub(r"[_\-]", "", t)        # drop separators before lookup
-    if t in _TOOLTYPE_MAP:
-        return _TOOLTYPE_MAP[t]
-
-    # ── FALLBACK: keyword-based classification ─────────────────────────────
-    # _TOOLTYPE_MAP only knows exact ToolType strings. If the frontend ever
-    # sends a variant we haven't enumerated (e.g. "oval", "ellipse",
-    # "useCaseShape", "actorShape", "boundaryShape"), the strict lookup above
-    # would leave it unrecognised — and _sanitize_shapes() would then SILENTLY
-    # DROP it (since it matches no _VALID_TYPES_BY_DIAGRAM entry), making a
-    # real use case/actor invisible to the LLM and causing false
-    # MISSING_USE_CASE / MISSING_ACTOR reports on an otherwise-correct canvas
-    # diagram. Loosely classify by keyword instead of dropping silently.
-    if "usecase" in t or "oval" in t or "ellipse" in t:
-        return "use_case_oval"
-    if "actor" in t:
-        return "actor"
-    if "boundary" in t:
-        return "system_boundary"
-    if "lifeline" in t and "object" not in t:
-        return "lifeline"
-    return t
+    return _TOOLTYPE_MAP.get(t, t)
 
 
 def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
@@ -159,12 +139,6 @@ def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
         if valid_types and clean_t not in valid_types:
             has_conn = any(s.get(f) for f in ("from", "to", "startLifeline", "endLifeline"))
             if not has_conn:
-                _log.warning(
-                    "Sanitizer dropped shape (raw_type=%r → clean_type=%r) not valid for "
-                    "diagram_type=%r — if this shape SHOULD exist in this diagram, add its "
-                    "raw type to _TOOLTYPE_MAP / the keyword fallback in _clean_type().",
-                    s.get("type", ""), clean_t, diagram_type,
-                )
                 continue  # skip this shape — it doesn't belong here
 
         # Build a minimal, clean dict for Gemini
@@ -177,15 +151,8 @@ def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
             val = s.get(field)
             if val is not None and str(val).strip().lower() not in ("", "none", "null", "undefined"):
                 # classFullShape text = "ClassName\n---attrs---\n..." — preserve full text for class shapes
-                # but send only class name for the "name" equivalent.
-                # IMPORTANT: this special-casing is ONLY valid for actual class-box
-                # shapes. Any other shape (use case oval, actor, etc.) can also end
-                # up with a "\n" in its text simply because the canvas UI wraps a
-                # long label onto two lines — splitting on that "\n" would truncate
-                # a real label (e.g. "manage shopping cart" → "manage") and send a
-                # misleading extra "_class_name" field, causing the LLM to think
-                # the label doesn't match the scenario (false EXTRA_USE_CASE, etc).
-                if field == "text" and clean_t == "class" and "\n" in str(val):
+                # but send only class name for the "name" equivalent
+                if field == "text" and "\n" in str(val):
                     # Keep full text so LLM can see attributes/methods
                     entry[field] = val
                     # Also expose the class name separately
@@ -1151,50 +1118,6 @@ def _existing_multiplicities(shapes: List[Dict]) -> set:
     return has_mult
 
 
-def _stem(word: str) -> str:
-    """Very light English stemmer — just enough to normalise plurals/tense for
-    matching diagram-element words against scenario words (e.g. 'deliveries'
-    ↔ 'delivery', 'payments' ↔ 'payment')."""
-    w = word.lower()
-    if len(w) > 4 and w.endswith("ies"):
-        return w[:-3] + "y"
-    if len(w) > 4 and w.endswith("es") and w[-3] not in "aeiou":
-        return w[:-2]
-    if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
-        return w[:-1]
-    return w
-
-
-_STOPWORDS = {"a", "an", "the", "and", "or", "of", "to", "for", "in", "on",
-              "by", "with", "their", "its", "his", "her", "system", "can"}
-
-
-def _content_stems(text: str) -> set:
-    """Lowercased, stemmed, stopword-filtered word set for fuzzy scenario matching."""
-    words = re.findall(r"[a-zA-Z]+", str(text).lower())
-    return {_stem(w) for w in words if w not in _STOPWORDS and len(w) > 1}
-
-
-def _scenario_mentions(element_name: str, scenario_stems: set) -> bool:
-    """
-    True if every meaningful word of `element_name` (stemmed) appears somewhere
-    in the scenario text (also stemmed) — regardless of order, phrasing, or
-    singular/plural ('track delivery' vs 'track deliveries', 'manage shopping
-    cart' vs 'manages the shopping carts', etc.).
-
-    This is a deliberately loose safety net: the LLM is asked to compare
-    meaning, not exact words, but it still occasionally flags EXTRA_USE_CASE /
-    EXTRA_ACTOR / EXTRA_CLASS for elements that ARE in the scenario just
-    reworded. If every content word of the element already appears in the
-    scenario, that's strong evidence the LLM's "extra" call is a false
-    positive, so we drop it rather than show the user a wrong error.
-    """
-    name_stems = _content_stems(element_name)
-    if not name_stems:
-        return False
-    return all(w in scenario_stems for w in name_stems)
-
-
 def _existing_names(shapes: List[Dict]) -> set:
     """All normalized names present in the diagram — for hallucination filtering."""
     names = set()
@@ -1212,16 +1135,12 @@ def _existing_names(shapes: List[Dict]) -> set:
 def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
                    llm_warnings: List[Dict], llm_info: List[Dict],
                    clean_shapes: List[Dict], llm_score: int, llm_summary: str,
-                   ignored_errors: Optional[List[str]] = None,
-                   scenario: str = "") -> Dict:
+                   ignored_errors: Optional[List[str]] = None) -> Dict:
     """
     Merge rule-based errors with LLM errors.
     - Rule errors: always trusted (deterministic).
     - LLM errors: filtered to remove hallucinations and capitalisation noise.
     - ignored_errors: list of error fingerprints that user has dismissed — never re-report them.
-    - scenario: original scenario text, used as a safety net to catch false-positive
-      EXTRA_USE_CASE / EXTRA_ACTOR / EXTRA_CLASS errors (element IS in the scenario,
-      just reworded/pluralised differently than the LLM expected).
     """
     SKIP_FROM_LLM = {
         "wrong_class_capitalisation", "wrong_capitalisation",
@@ -1245,7 +1164,6 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
     existing_rels = _existing_relationships(clean_shapes)
     existing_mult = _existing_multiplicities(clean_shapes)
     ignored_set   = set(ignored_errors or [])
-    scenario_stems = _content_stems(scenario)
 
     def _error_fingerprint(e: Dict) -> str:
         """Unique key for an error — used for ignored_errors matching."""
@@ -1323,15 +1241,6 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
         if et in ("missing_relationship", "missing_association_label") and frm and to:
             if frozenset({frm, to}) in existing_rels:
                 return False
-
-        # Drop EXTRA_USE_CASE / EXTRA_ACTOR / EXTRA_CLASS if the element's words
-        # ALL appear in the scenario text (just reworded/pluralised differently
-        # than the LLM expected, e.g. "track delivery" vs scenario's "track
-        # deliveries"). The LLM is told to compare meaning not exact words, but
-        # it still occasionally misses this — this is a deterministic safety net.
-        if et in ("extra_use_case", "extra_actor", "extra_class") and elem:
-            if _scenario_mentions(elem, scenario_stems):
-                return False  # element's words are in the scenario — false positive
 
         return True
 
@@ -2170,7 +2079,6 @@ def validate_with_openai(
             int(result.get("score", 50)),
             result.get("summary", ""),
             _ignored,
-            scenario,
         )
 
     # LLM failed — return rule-only results
