@@ -651,19 +651,32 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
                     })
 
     # ── Blank/Empty Use Case check ──────────────────────────────────────────
-    # Check every use case oval — if it has no text → EMPTY_USE_CASE_LABEL error
+    # This catches use case ovals that slipped past the main loop above
+    # (e.g. type variants like "oval", "ellipse", "useCase" etc.)
+    _UC_TYPE_VARIANTS = ("use_case_oval", "usecase", "use_case", "oval", "ellipse", "usecaseoval")
     for s in shapes:
-        t = s.get("type", "").lower()
-        if "usecase" in t or "use_case" in t or "oval" in t or "ellipse" in t:
-            label = str(s.get("text", "") or s.get("label", "") or s.get("name", "") or "").strip()
-            if not label or label.lower() in ("", "none", "null", "undefined", "use case", "usecase"):
-                errors.append({
-                    "error_type": "EMPTY_USE_CASE_LABEL", "severity": "ERROR",
-                    "element": "Unlabelled use case",
-                    "description": "A use case oval has no label or an empty name.",
-                    "suggestion": "Give this use case a meaningful name e.g. 'Place Order', 'Browse Products'.",
-                    "auto_fix": {"fixable": False},
-                })
+        t = s.get("type", "").lower().replace("-", "_").replace(" ", "_")
+        if any(v in t for v in _UC_TYPE_VARIANTS):
+            label = str(
+                s.get("text", "") or s.get("label", "") or
+                s.get("name", "") or s.get("displayName", "") or ""
+            ).strip()
+            _EMPTY_LABELS = {"", "none", "null", "undefined", "use case",
+                             "usecase", "use_case", "oval", "label", "name"}
+            if label.lower() in _EMPTY_LABELS:
+                # Only add if not already reported as UNLABELLED_USE_CASE
+                already = any(
+                    e.get("error_type") in ("UNLABELLED_USE_CASE", "EMPTY_USE_CASE_LABEL")
+                    for e in errors
+                )
+                if not already:
+                    errors.append({
+                        "error_type": "EMPTY_USE_CASE_LABEL", "severity": "ERROR",
+                        "element": "Unlabelled use case",
+                        "description": "A use case oval has no label or an empty name.",
+                        "suggestion": "Give this use case a meaningful name e.g. 'Place Order', 'Browse Products'.",
+                        "auto_fix": {"fixable": False},
+                    })
 
     # ── Connection checking (name-based + geometry-based) ──────────────────
     # Method 1: name-based — arrow shapes that carry explicit from/to (or
@@ -691,8 +704,10 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
             if norm_name in connected:
                 continue
             shape = next(
-                (s for s in shapes if s.get("type") == "actor"
-                 and _n(_shape_name(s)) == norm_name),
+                (s for s in shapes if any(
+                    v in s.get("type", "").lower()
+                    for v in ("actor", "stickman", "person", "human")
+                ) and _n(_shape_name(s)) == norm_name),
                 None,
             )
             if shape and any(_line_touches(ln, shape) for ln in line_shapes):
@@ -702,8 +717,10 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
             if norm_name in connected:
                 continue
             shape = next(
-                (s for s in shapes if s.get("type") == "use_case_oval"
-                 and _n(_shape_name(s)) == norm_name),
+                (s for s in shapes if any(
+                    v in s.get("type", "").lower().replace("-","_")
+                    for v in ("use_case_oval", "usecase", "oval", "ellipse")
+                ) and _n(_shape_name(s)) == norm_name),
                 None,
             )
             if shape and any(_line_touches(ln, shape) for ln in line_shapes):
@@ -1529,10 +1546,13 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - Only report issues you are CONFIDENT about. Do NOT invent errors.
 
 ### MISSING_CLASS:
-- STRICT: Only report for nouns EXPLICITLY written as class names in the scenario.
-- STRICT: Method names like "submitOrder()" are METHODS, never classes.
-- STRICT: Attribute names like "orderId", "price" are ATTRIBUTES, never classes.
-- STRICT: If a class name in the diagram is a close misspelling of a scenario class → report SPELLING_MISTAKE ONLY, NOT MISSING_CLASS.
+- Check EVERY key noun/entity explicitly mentioned in the scenario against the diagram shapes.
+- If a key entity from the scenario has NO matching class shape in the diagram → report MISSING_CLASS as ERROR.
+- STRICT: Method names like "submitOrder()" are METHODS not classes — do NOT report as MISSING_CLASS.
+- STRICT: Attribute names like "orderId", "price" are ATTRIBUTES not classes — do NOT report.
+- STRICT: If a class exists with a close misspelling → report SPELLING_MISTAKE ONLY, NOT MISSING_CLASS.
+- STRICT: If a class exists with wrong capitalisation → report WRONG_CLASS_CAPITALISATION, NOT MISSING_CLASS.
+- IMPORTANT: Do NOT skip genuinely missing classes — if a key entity is absent, always report it.
 
 ### MISSING_RELATIONSHIP:
 - STRICT: Only report if scenario EXPLICITLY uses trigger words: has, contains, inherits, is a type of, consists of, is composed of, manages, holds, etc.
@@ -2270,8 +2290,13 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 
 ## WRONG ASSOCIATION LABEL RULE — CRITICAL:
 - Check every association/aggregation/composition arrow that HAS a visible label.
-- If the drawn label does NOT match what the scenario describes for that relationship → report WRONG_ASSOCIATION_LABEL as a WARNING.
+- ALWAYS check every visible arrow label in the image against the scenario.
+- If a drawn label does NOT match what the scenario describes → report WRONG_ASSOCIATION_LABEL as WARNING.
 - Example: scenario says "Bank manages Customer" but arrow label reads "owns" → WRONG_ASSOCIATION_LABEL.
+- Example: scenario says "Teacher teaches Student" but arrow label reads "trains" → WRONG_ASSOCIATION_LABEL.
+- Include the correct label in the suggestion: "Change label to 'X' as described in scenario."
+- auto_fix: fixable: true, action: add_label, from_element, to_element, label: <correct label>
+- STRICT: Report this whenever a label is visibly wrong — do not skip it.
 - suggestion: ALWAYS name the exact correct word/phrase from the scenario, e.g. "Change label 'owns' to 'manages' as described in the scenario."
 - Minor wording variations (e.g. "manage" vs "manages") are acceptable — do NOT report those.
 
