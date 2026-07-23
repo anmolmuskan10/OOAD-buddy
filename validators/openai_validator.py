@@ -18,6 +18,7 @@ FIX: Shape sanitizer added — strips ToolType. prefix, filters shapes by
 import os
 import json
 import logging
+import math
 import re
 import time
 import urllib.request
@@ -39,7 +40,7 @@ _SYSTEM_MESSAGE = (
     "You are a strict, deterministic UML diagram validator. "
     "ALL name matching is CASE-INSENSITIVE — 'login' and 'Login' are identical. "
     "NEVER report missing/extra elements due to capitalisation differences. "
-    "NEVER report DISCONNECTED_ACTOR or ISOLATED_USE_CASE — connection checking is done separately. "
+    "DISCONNECTED_ACTOR and ISOLATED_USE_CASE are checked by rule engine — do NOT duplicate them. "
     "Only report scenario-based structural errors you are 100% certain about. "
     "Return valid JSON only — no markdown, no prose."
 )
@@ -118,7 +119,27 @@ def _clean_type(raw_type: str) -> str:
     if "." in t:
         t = t.split(".")[-1]            # 'ToolType.classFullShape' → 'classfullshape'
     t = re.sub(r"[_\-]", "", t)        # drop separators before lookup
-    return _TOOLTYPE_MAP.get(t, t)
+    if t in _TOOLTYPE_MAP:
+        return _TOOLTYPE_MAP[t]
+
+    # ── FALLBACK: keyword-based classification ─────────────────────────────
+    # _TOOLTYPE_MAP only knows exact ToolType strings. If the frontend ever
+    # sends a variant we haven't enumerated (e.g. "oval", "ellipse",
+    # "useCaseShape", "actorShape", "boundaryShape"), the strict lookup above
+    # would leave it unrecognised — and _sanitize_shapes() would then SILENTLY
+    # DROP it (since it matches no _VALID_TYPES_BY_DIAGRAM entry), making a
+    # real use case/actor invisible to the LLM and causing false
+    # MISSING_USE_CASE / MISSING_ACTOR reports on an otherwise-correct canvas
+    # diagram. Loosely classify by keyword instead of dropping silently.
+    if "usecase" in t or "oval" in t or "ellipse" in t:
+        return "use_case_oval"
+    if "actor" in t:
+        return "actor"
+    if "boundary" in t:
+        return "system_boundary"
+    if "lifeline" in t and "object" not in t:
+        return "lifeline"
+    return t
 
 
 def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
@@ -138,6 +159,12 @@ def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
         if valid_types and clean_t not in valid_types:
             has_conn = any(s.get(f) for f in ("from", "to", "startLifeline", "endLifeline"))
             if not has_conn:
+                _log.warning(
+                    "Sanitizer dropped shape (raw_type=%r → clean_type=%r) not valid for "
+                    "diagram_type=%r — if this shape SHOULD exist in this diagram, add its "
+                    "raw type to _TOOLTYPE_MAP / the keyword fallback in _clean_type().",
+                    s.get("type", ""), clean_t, diagram_type,
+                )
                 continue  # skip this shape — it doesn't belong here
 
         # Build a minimal, clean dict for Gemini
@@ -145,7 +172,8 @@ def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
         for field in ("text", "label", "name", "id", "from", "to",
                       "startLifeline", "endLifeline", "lifelineRef",
                       "multiplicity_start", "multiplicity_end",
-                      "relationship_label", "attributes", "methods"):
+                      "relationship_label", "attributes", "methods",
+                      "position", "endPosition", "size"):
             val = s.get(field)
             if val is not None and str(val).strip().lower() not in ("", "none", "null", "undefined"):
                 # classFullShape text = "ClassName\n---attrs---\n..." — preserve full text for class shapes
@@ -167,7 +195,7 @@ def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
 # Jab Gemini fixable: true nahi deta, hum error_type se apna fix banate hain
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_fallback_fix(error_type: str, element: str, raw_error: dict, diagram_type: str) -> dict:
+def _build_fallback_fix(error_type: str, element: str, raw_error: dict, diagram_type: str, scenario: str = "") -> dict:
     """
     Gemini ka auto_fix agar incomplete/missing ho — error_type se fallback fix banao.
     Ye ensure karta hai ke common fixable errors hamesha fixable rahein.
@@ -185,6 +213,22 @@ def _build_fallback_fix(error_type: str, element: str, raw_error: dict, diagram_
 
     if "EMPTY_CLASS_NAME" in et:
         return {"fixable": True, "action": "rename_shape", "name": element or "ClassName"}
+
+    if "MISSING_ASSOCIATION_NAME" in et or "MISSING_ASSOCIATION_LABEL" in et:
+        # element is usually "ClassA → ClassB" (or "ClassA - ClassB")
+        from_el, to_el = _parse_from_to(desc + " " + suggestion.lower())
+        if not (from_el and to_el):
+            sep = "\u2192" if "\u2192" in element else ("-" if "-" in element else None)
+            if sep:
+                parts = element.split(sep)
+                if len(parts) >= 2:
+                    from_el, to_el = parts[0].strip(), parts[1].strip()
+        if from_el and to_el:
+            label = _suggest_relationship_label(scenario, from_el, to_el)
+            if label:
+                return {"fixable": True, "action": "add_label",
+                        "from_element": from_el, "to_element": to_el, "name": label}
+        return {"fixable": False}
 
     if "MISSING_RELATIONSHIP" in et or "MISSING_RELATIONSHIP" in et:
         # Try to parse from_element and to_element from description/suggestion
@@ -354,10 +398,217 @@ def _build_connection_map(shapes: List[Dict]) -> Dict[str, set]:
     return connections
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  POS tagging helper — used for accurate MISSING_NOUN / MISSING_VERB_IN_USE_CASE
+#  / ACTOR_SHOULD_BE_NOUN checks. Uses spaCy (already a project dependency,
+#  same model nlp_extractor.py loads) with a lazy, cached load so the model
+#  is only loaded once per process. Falls back to a keyword list if spaCy or
+#  the model isn't available, so these checks never hard-crash the request.
+# ─────────────────────────────────────────────────────────────────────────────
+_POS_MODEL = None
+_POS_MODEL_TRIED = False
+
+# Much larger fallback verb list than before (used only if spaCy unavailable).
+_FALLBACK_VERBS = {
+    "add","apply","approve","authenticate","authorize","browse","buy",
+    "calculate","cancel","change","check","close","complete","confirm",
+    "create","delete","display","download","edit","enter","export",
+    "filter","generate","get","handle","import","initiate","insert",
+    "launch","list","log","login","logout","make","manage","modify","monitor",
+    "notify","open","pay","perform","place","print","process","provide",
+    "purchase","read","receive","register","remove","request","reset",
+    "retrieve","review","save","search","select","send","set","show",
+    "sign","start","submit","track","update","upload","validate","verify",
+    "view","withdraw","write",
+    # ── previously missing verbs ──
+    "book","reserve","checkout","return","renew","borrow","assign","grant",
+    "deposit","transfer","order","ship","deliver","schedule","unlock","lock",
+    "compare","rate","share","invite","join","leave","subscribe",
+    "unsubscribe","publish","post","comment","like","follow","unfollow",
+    "block","report","finish","install","uninstall","configure","customize",
+    "sync","backup","restore","encrypt","decrypt","scan","fax","email",
+    "message","chat","call","record","pause","resume","stop","rewind",
+    "forward","upgrade","downgrade","activate","deactivate","enable","disable",
+    "redeem","refund","dispute","escalate","assign","allocate","withdraw",
+    "deposit","transfer","exchange","swap","merge","split","archive",
+    "restore","recover","terminate","suspend","resume","renew","extend",
+}
+
+# Common actor/role nouns that must NEVER be flagged as verbs, even if a POS
+# tagger mistags a bare standalone word (spaCy has no sentence context for a
+# single shape label and sometimes guesses VERB for short unknown words like
+# "admin"). This whitelist always wins over the tagger's guess.
+_COMMON_ROLE_NOUNS = {
+    "admin", "administrator", "customer", "user", "client", "manager",
+    "system", "bank", "employee", "staff", "guest", "visitor", "operator",
+    "supervisor", "student", "teacher", "instructor", "vendor", "supplier",
+    "seller", "buyer", "member", "moderator", "owner", "driver", "rider",
+    "passenger", "doctor", "nurse", "patient", "librarian", "cashier",
+    "auditor", "agent", "clerk", "receptionist", "technician", "engineer",
+    "developer", "analyst", "director", "president", "ceo", "hr",
+    "accountant", "warehouse", "merchant", "shopkeeper", "tenant",
+    "landlord", "guardian", "parent", "child", "applicant", "recruiter",
+    "payment gateway", "third party", "external system",
+}
+
+
+def _is_known_role_noun(name: str) -> bool:
+    return (name or "").strip().lower() in _COMMON_ROLE_NOUNS
+
+
+def _get_pos_model():
+    """Lazily load & cache the spaCy model. Returns None if unavailable."""
+    global _POS_MODEL, _POS_MODEL_TRIED
+    if _POS_MODEL_TRIED:
+        return _POS_MODEL
+    _POS_MODEL_TRIED = True
+    try:
+        import spacy  # type: ignore
+        _POS_MODEL = spacy.load("en_core_web_sm")
+    except Exception as e:
+        _log.warning("POS model unavailable, falling back to verb keyword list: %s", e)
+        _POS_MODEL = None
+    return _POS_MODEL
+
+
+def _pos_analyze(name: str) -> Dict[str, bool]:
+    """
+    Analyze a shape name and return {'has_verb': bool, 'has_noun': bool}.
+    Uses real POS tagging when spaCy is available; otherwise falls back to
+    a keyword-list heuristic (still checks BOTH verb presence and noun
+    presence, unlike the old first-word-only check).
+    """
+    name = (name or "").strip()
+    if not name:
+        return {"has_verb": False, "has_noun": False}
+
+    # Safety override: known role/entity nouns are never verbs, regardless
+    # of what the POS tagger guesses for a bare standalone word.
+    if _is_known_role_noun(name):
+        return {"has_verb": False, "has_noun": True}
+
+    nlp = _get_pos_model()
+    if nlp is not None:
+        doc = nlp(name)
+        has_verb = any(t.pos_ in ("VERB", "AUX") for t in doc)
+        has_noun = any(t.pos_ in ("NOUN", "PROPN") for t in doc)
+        return {"has_verb": has_verb, "has_noun": has_noun}
+
+    # ── Fallback: keyword-list heuristic ──
+    # spaCy unavailable — use a conservative convention-based heuristic instead
+    # of pure list-membership, since words like "order"/"report" can be BOTH
+    # noun and verb and a naive list lookup would misclassify "Manage Order".
+    words = [w.lower() for w in name.split()]
+    if not words:
+        return {"has_verb": False, "has_noun": False}
+    has_verb = words[0] in _FALLBACK_VERBS
+    if len(words) > 1:
+        # Standard UML naming convention is "Verb Noun" (e.g. "Manage Order") —
+        # trust that a second word is the object/noun.
+        has_noun = True
+    else:
+        has_noun = words[0] not in _FALLBACK_VERBS
+    return {"has_verb": has_verb, "has_noun": has_noun}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GEOMETRY-BASED CONNECTION DETECTION — ported from usecase_validator.py
+# (proven spatial-detection logic: position + size + line endpoints touching
+# a shape's bounding box). Used as a SECOND, independent way to detect
+# connections, alongside the existing name-field (from/to) based check.
+# A shape counts as "connected" if EITHER method finds a connection.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Max px distance from a line endpoint to a shape's bbox to count as "touching"
+_HIT_RADIUS = 40.0
+
+# Line/arrow types (already-cleaned names, post _clean_type) that can carry a
+# spatial connection in a use case diagram.
+_USECASE_LINE_TYPES = {
+    "arrow", "line", "dashed_arrow", "dashed_open_arrow", "dotted_arrow",
+    "include_extend_arrow", "generalization_arrow", "association_arrow",
+}
+
+
+def _geo_pos(shape: Dict) -> Optional[tuple]:
+    """Shape's (x, y) position — top-left for shapes, start-point for lines."""
+    p = shape.get("position")
+    if not isinstance(p, dict):
+        return None
+    try:
+        return float(p.get("dx", 0)), float(p.get("dy", 0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _geo_end_abs(shape: Dict) -> Optional[tuple]:
+    """Absolute end point of a line: position + endPosition (relative offset)."""
+    ep = shape.get("endPosition")
+    if not isinstance(ep, dict):
+        return None
+    pos = _geo_pos(shape)
+    if pos is None:
+        return None
+    try:
+        return pos[0] + float(ep.get("dx", 0)), pos[1] + float(ep.get("dy", 0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _geo_size(shape: Dict) -> tuple:
+    s = shape.get("size")
+    if not isinstance(s, dict):
+        return 80.0, 60.0
+    try:
+        return float(s.get("width", 80)), float(s.get("height", 60))
+    except (TypeError, ValueError):
+        return 80.0, 60.0
+
+
+def _geo_bbox(shape: Dict) -> Optional[tuple]:
+    pos = _geo_pos(shape)
+    if pos is None:
+        return None
+    w, h = _geo_size(shape)
+    x, y = pos
+    return x, y, x + w, y + h
+
+
+def _pt_near_bbox(px: float, py: float, bbox: tuple, radius: float = _HIT_RADIUS) -> bool:
+    """True if point (px, py) is within `radius` of the axis-aligned bbox."""
+    x1, y1, x2, y2 = bbox
+    cx = max(x1, min(px, x2))
+    cy = max(y1, min(py, y2))
+    return math.hypot(px - cx, py - cy) <= radius
+
+
+def _line_touches(line: Dict, shape: Dict, radius: float = _HIT_RADIUS) -> bool:
+    """
+    True if either endpoint of `line` is within `radius` of `shape`'s bbox.
+    Returns False (not True) when position/size data is missing, so this
+    check never produces false positives when geometry simply isn't present
+    in the payload — the name-based check still covers that case.
+    """
+    bbox = _geo_bbox(shape)
+    if bbox is None:
+        return False
+
+    start = _geo_pos(line)
+    if start is not None and _pt_near_bbox(start[0], start[1], bbox, radius):
+        return True
+
+    end = _geo_end_abs(line)
+    if end is not None and _pt_near_bbox(end[0], end[1], bbox, radius):
+        return True
+
+    return False
+
+
 def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
     """
     Deterministic rule-based checks for use case diagrams.
-    Handles: empty names, duplicates, disconnected actors/use-cases, capitalisation.
+    Handles: empty names, duplicates, disconnected actors/use-cases, capitalisation,
+    and noun/verb correctness (via spaCy POS tagging, with keyword-list fallback).
     Does NOT need LLM — all checks are from shape data directly.
     """
     errors = []
@@ -411,55 +662,109 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
             else:
                 use_cases[n] = name
 
-                # Check: use case name should start with a verb (action word)
-                # Common UML verbs list
-                _COMMON_VERBS = {
-                    "add","apply","approve","authenticate","authorize","browse","buy",
-                    "calculate","cancel","change","check","close","complete","confirm",
-                    "create","delete","display","download","edit","enter","export",
-                    "filter","generate","get","handle","import","initiate","insert",
-                    "launch","list","log","login","logout","make","manage","modify","monitor",
-                    "notify","open","pay","perform","place","print","process","provide",
-                    "purchase","read","receive","register","remove","request","reset",
-                    "retrieve","review","save","search","select","send","set","show",
-                    "sign","start","submit","track","update","upload","validate","verify",
-                    "view","withdraw","write",
-                }
-                first_word = name.strip().split()[0].lower() if name.strip() else ""
-                if first_word and first_word not in _COMMON_VERBS:
+                # ── Use case naming format check: STRICT "Verb + Noun" only ──
+                # A use case oval's label must be exactly a verb followed by a
+                # noun/object (e.g. "Manage Order", "Place Order"). Any name
+                # that does not satisfy BOTH parts is reported as ONE error.
+                _pos = _pos_analyze(name)
+                if not (_pos["has_verb"] and _pos["has_noun"]):
                     errors.append({
                         "error_type": "MISSING_VERB_IN_USE_CASE", "severity": "WARNING",
                         "element": name,
-                        "description": f"Use case '{name}' does not start with an action verb.",
-                        "suggestion": f"Rename '{name}' to start with a verb, e.g. 'Manage {name}' or 'Process {name}'.",
+                        "description": f"Use case '{name}' must follow the 'Verb + Noun' naming format only (e.g. 'Manage Order', 'Place Order') — a verb followed by a noun, nothing more.",
+                        "suggestion": f"Rename '{name}' to a verb + noun, e.g. 'Manage {name}' or 'Process {name}'.",
                         "auto_fix": {"fixable": True, "action": "rename_shape", "name": f"Manage {name}"},
                     })
 
-    # NOTE: Connection checking (DISCONNECTED_ACTOR / ISOLATED_USE_CASE) is intentionally
-    # NOT done here. Flutter arrows use spatial positioning — their from/to fields are empty,
-    # so _build_connection_map() would always return an empty map and produce false positives.
-    # Spatial connection checking is handled correctly by usecase_validator.py (_line_touches()).
+    # ── Blank/Empty Use Case check ──────────────────────────────────────────
+    # Check every use case oval — if it has no text → EMPTY_USE_CASE_LABEL error
+    for s in shapes:
+        t = s.get("type", "").lower()
+        if "usecase" in t or "use_case" in t or "oval" in t or "ellipse" in t:
+            label = str(s.get("text", "") or s.get("label", "") or s.get("name", "") or "").strip()
+            if not label or label.lower() in ("", "none", "null", "undefined", "use case", "usecase"):
+                errors.append({
+                    "error_type": "EMPTY_USE_CASE_LABEL", "severity": "ERROR",
+                    "element": "Unlabelled use case",
+                    "description": "A use case oval has no label or an empty name.",
+                    "suggestion": "Give this use case a meaningful name e.g. 'Place Order', 'Browse Products'.",
+                    "auto_fix": {"fixable": False},
+                })
 
-    # Check: actor names should be nouns (not start with a verb)
-    _COMMON_VERBS_ACTOR = {
-        "add","apply","approve","authenticate","authorize","browse","buy",
-        "calculate","cancel","change","check","close","complete","confirm",
-        "create","delete","display","download","edit","enter","export",
-        "filter","generate","get","handle","import","initiate","insert",
-        "launch","list","log","login","logout","manage","modify","monitor",
-        "notify","open","pay","perform","place","print","process","provide",
-        "purchase","read","receive","register","remove","request","reset",
-        "retrieve","review","save","search","select","send","set","show",
-        "sign","start","submit","track","update","upload","validate","verify",
-        "view","withdraw","write",
-    }
+    # ── Connection checking (name-based + geometry-based) ──────────────────
+    # Method 1: name-based — arrow shapes that carry explicit from/to (or
+    # equivalent) fields naming the connected elements.
+    connected = set()
+    for s in shapes:
+        t = s.get("type", "")
+        if any(k in t for k in ("arrow", "line", "association", "connector")):
+            for key in ("from", "to", "startShape", "endShape", "source", "target"):
+                val = _n(str(s.get(key) or ""))
+                if val:
+                    connected.add(val)
+
+    # Method 2: geometry-based (ported from usecase_validator.py) — a shape is
+    # "connected" if any line's endpoint (position / position+endPosition)
+    # lands within _HIT_RADIUS of that shape's bbox (position + size). This
+    # catches diagrams where lines are drawn visually touching a shape but
+    # don't carry explicit from/to name fields — the exact false-positive
+    # ("connected use case wrongly flagged as isolated") this was fixing.
+    # A shape only needs to satisfy ONE of the two methods to count as connected.
+    line_shapes = [s for s in shapes if _n(str(s.get("type", ""))) in _USECASE_LINE_TYPES]
+
+    if line_shapes:
+        for norm_name, orig_name in actors.items():
+            if norm_name in connected:
+                continue
+            shape = next(
+                (s for s in shapes if s.get("type") == "actor"
+                 and _n(_shape_name(s)) == norm_name),
+                None,
+            )
+            if shape and any(_line_touches(ln, shape) for ln in line_shapes):
+                connected.add(norm_name)
+
+        for norm_name, orig_name in use_cases.items():
+            if norm_name in connected:
+                continue
+            shape = next(
+                (s for s in shapes if s.get("type") == "use_case_oval"
+                 and _n(_shape_name(s)) == norm_name),
+                None,
+            )
+            if shape and any(_line_touches(ln, shape) for ln in line_shapes):
+                connected.add(norm_name)
+
+    # DISCONNECTED_ACTOR: actor with no arrow connecting to any use case
+    for norm_name, orig_name in actors.items():
+        if norm_name not in connected:
+            errors.append({
+                "error_type": "DISCONNECTED_ACTOR", "severity": "ERROR",
+                "element": orig_name,
+                "description": f"Actor '{orig_name}' is not connected to any use case.",
+                "suggestion": f"Draw an association line from '{orig_name}' to at least one use case.",
+                "auto_fix": {"fixable": False},
+            })
+
+    # ISOLATED_USE_CASE: use case oval with no arrow connecting to any actor
+    for norm_name, orig_name in use_cases.items():
+        if norm_name not in connected:
+            errors.append({
+                "error_type": "ISOLATED_USE_CASE", "severity": "ERROR",
+                "element": orig_name,
+                "description": f"Use case '{orig_name}' is not connected to any actor.",
+                "suggestion": f"Connect '{orig_name}' to at least one actor.",
+                "auto_fix": {"fixable": False},
+            })
+
+    # Check: actor names should be nouns/roles, not verbs/actions (POS-based)
     for n, orig in actors.items():
-        first_word = orig.strip().split()[0].lower() if orig.strip() else ""
-        if first_word and first_word in _COMMON_VERBS_ACTOR:
+        _pos = _pos_analyze(orig)
+        if _pos["has_verb"] and not _pos["has_noun"]:
             errors.append({
                 "error_type": "ACTOR_SHOULD_BE_NOUN", "severity": "WARNING",
                 "element": orig,
-                "description": f"Actor '{orig}' appears to start with a verb. Actors should represent roles or entities (nouns), not actions.",
+                "description": f"Actor '{orig}' appears to be a verb/action. Actors should represent roles or entities (nouns), not actions.",
                 "suggestion": f"Rename '{orig}' to a role or entity name, e.g. 'Customer', 'Admin', or 'System'.",
                 "auto_fix": {"fixable": False},
             })
@@ -467,7 +772,109 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
     return errors
 
 
-def _rule_check_class(shapes: List[Dict]) -> List[Dict]:
+# ─────────────────────────────────────────────────────────────────────────────
+# ASSOCIATION-NAME SUGGESTION — for class diagram MISSING_ASSOCIATION_NAME.
+# Scans the scenario text for the sentence connecting two class names and
+# suggests the actual verb/phrase that should be used as the label.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_REL_LINK_PHRASES = [
+    "works for", "worked for", "placed by", "created by", "owned by",
+    "assigned to", "reports to", "belongs to", "consists of", "made up of",
+    "has a", "has an", "have a", "have an", "is a", "is an", "are a", "are an",
+]
+
+_REL_MODAL_VERBS = {"can", "could", "may", "might", "must", "shall", "should", "will", "would"}
+_REL_IRREGULAR_PRESENT = {
+    "have": "has", "be": "is", "do": "does", "go": "goes",
+    "has": "has", "is": "is", "does": "does", "goes": "goes",
+}
+
+
+def _to_present_tense(verb: str) -> str:
+    """Normalize a verb to lowercase, 3rd-person-singular present tense."""
+    v = verb.lower().strip()
+    if not v:
+        return v
+    if v in _REL_IRREGULAR_PRESENT:
+        return _REL_IRREGULAR_PRESENT[v]
+    if v in _REL_MODAL_VERBS:
+        return v
+    if v.endswith("y") and len(v) > 1 and v[-2] not in "aeiou":
+        return v[:-1] + "ies"
+    if v.endswith(("s", "x", "z", "ch", "sh")):
+        return v + "es"
+    if v.endswith("e"):
+        return v + "s"          # place -> places, manage -> manages
+    return v + "s"               # work -> works, contain -> contains
+
+
+def _name_variants(name: str) -> set:
+    n = name.lower().strip()
+    variants = {n}
+    if n.endswith("y") and len(n) > 1 and n[-2] not in "aeiou":
+        variants.add(n[:-1] + "ies")
+    else:
+        variants.add(n + "s")
+    if n.endswith("s"):
+        variants.add(n[:-1])
+    return variants
+
+
+def _suggest_relationship_label(scenario: str, name_a: str, name_b: str) -> Optional[str]:
+    """
+    Find the sentence in `scenario` that mentions both `name_a` and `name_b`,
+    and suggest the verb/phrase connecting them as a lowercase, present-tense
+    association-name label.
+
+    Priority:
+      1. Known linking phrases ("has a", "works for", "placed by", ...) —
+         used verbatim as the label if present.
+      2. spaCy-tagged main verb between the two names (modal verbs like
+         "can"/"may" are skipped in favour of the actual action verb, and
+         the verb is normalized to present tense, e.g. "can place" -> "places").
+      3. Keyword-list fallback verb if spaCy isn't available.
+
+    Returns None if no relevant sentence / verb can be found — caller should
+    fall back to a generic suggestion in that case.
+    """
+    if not scenario or not name_a or not name_b:
+        return None
+
+    sentences = re.split(r"(?<=[.!?])\s+", scenario.strip())
+    va, vb = _name_variants(name_a), _name_variants(name_b)
+
+    for sent in sentences:
+        s_low = sent.lower()
+        if not (any(x in s_low for x in va) and any(x in s_low for x in vb)):
+            continue
+
+        # 1) Known has-a / is-a / role phrases — use directly as the label
+        for phrase in _REL_LINK_PHRASES:
+            if phrase in s_low:
+                return phrase
+
+        # 2) spaCy main-verb extraction (skip modals/aux, prefer the last
+        #    substantive verb — i.e. the more specific one when 2 verbs exist)
+        nlp = _get_pos_model()
+        if nlp is not None:
+            doc = nlp(sent)
+            verbs = [t for t in doc if t.pos_ in ("VERB", "AUX")]
+            main_verbs = [t for t in verbs if t.lemma_.lower() not in _REL_MODAL_VERBS]
+            chosen = main_verbs[-1] if main_verbs else (verbs[-1] if verbs else None)
+            if chosen is not None:
+                return _to_present_tense(chosen.lemma_)
+
+        # 3) Fallback: scan words for a known action verb from the keyword list
+        words = re.findall(r"[a-zA-Z']+", s_low)
+        fallback_hits = [w for w in words if w in _FALLBACK_VERBS and w not in _REL_MODAL_VERBS]
+        if fallback_hits:
+            return _to_present_tense(fallback_hits[-1])
+
+    return None
+
+
+def _rule_check_class(shapes: List[Dict], scenario: str = "") -> List[Dict]:
     """Deterministic rule checks for class diagrams."""
     errors = []
     class_names = {}  # norm -> original
@@ -505,6 +912,118 @@ def _rule_check_class(shapes: List[Dict]) -> List[Dict]:
                     "suggestion": f"Rename '{name}' to '{correct}'.",
                     "auto_fix": {"fixable": True, "action": "rename_shape", "name": correct},
                 })
+    # ── Multiplicity + Association-Name checks (previously missing entirely) ──
+    # Every association/aggregation/composition arrow must have valid
+    # multiplicity on BOTH ends and a name label at its midpoint.
+    # Generalization/dependency/realization arrows are excluded — they never
+    # carry multiplicity or a name by UML convention.
+    _VALID_MULT_RE = re.compile(r"^(\d+|\*)(\.\.(\d+|\*))?$")
+    _NO_MULT_KEYWORDS = ("generalization", "inheritance", "extend", "realization",
+                         "dependency", "depend", "include")
+    _MULT_ARROW_KEYWORDS = ("association", "aggregation", "composition")
+
+    for s in shapes:
+        t = str(s.get("type", "")).lower()
+        if not any(k in t for k in _MULT_ARROW_KEYWORDS):
+            continue
+        if any(k in t for k in _NO_MULT_KEYWORDS):
+            continue
+
+        frm_raw = str(s.get("from") or "")
+        to_raw  = str(s.get("to")   or "")
+        frm_n, to_n = _n(frm_raw), _n(to_raw)
+        if not frm_n or not to_n:
+            continue  # can't identify endpoints — skip rather than guess
+
+        frm_disp = class_names.get(frm_n, frm_raw)
+        to_disp  = class_names.get(to_n,  to_raw)
+
+        m_start = str(s.get("multiplicity_start") or "").strip()
+        m_end   = str(s.get("multiplicity_end")   or "").strip()
+
+        # ── MISSING_MULTIPLICITY ──
+        if not m_start and not m_end:
+            errors.append({
+                "error_type": "MISSING_MULTIPLICITY", "severity": "ERROR",
+                "element": f"{frm_disp} \u2192 {to_disp}",
+                "description": f"Relationship '{frm_disp}' \u2192 '{to_disp}' is missing multiplicity on both ends.",
+                "suggestion": "Add multiplicity labels (e.g., '1', '0..*', '1..*') on both sides of the relationship.",
+                "auto_fix": {"fixable": True, "action": "update_multiplicity",
+                             "from_element": frm_disp, "to_element": to_disp,
+                             "multiplicity_from": "1", "multiplicity_to": "*"},
+            })
+        elif not m_start:
+            errors.append({
+                "error_type": "MISSING_MULTIPLICITY", "severity": "ERROR",
+                "element": f"{frm_disp} \u2192 {to_disp}",
+                "description": f"Relationship '{frm_disp}' \u2192 '{to_disp}' is missing multiplicity on the '{frm_disp}' side.",
+                "suggestion": f"Add a multiplicity label (e.g., '1', '0..*') on the '{frm_disp}' side.",
+                "auto_fix": {"fixable": True, "action": "update_multiplicity",
+                             "from_element": frm_disp, "to_element": to_disp,
+                             "multiplicity_from": "1", "multiplicity_to": m_end},
+            })
+        elif not m_end:
+            errors.append({
+                "error_type": "MISSING_MULTIPLICITY", "severity": "ERROR",
+                "element": f"{frm_disp} \u2192 {to_disp}",
+                "description": f"Relationship '{frm_disp}' \u2192 '{to_disp}' is missing multiplicity on the '{to_disp}' side.",
+                "suggestion": f"Add a multiplicity label (e.g., '1', '0..*') on the '{to_disp}' side.",
+                "auto_fix": {"fixable": True, "action": "update_multiplicity",
+                             "from_element": frm_disp, "to_element": to_disp,
+                             "multiplicity_from": m_start, "multiplicity_to": "*"},
+            })
+        else:
+            # ── INVALID_MULTIPLICITY — both present but format is malformed ──
+            bad_start = not _VALID_MULT_RE.match(m_start)
+            bad_end   = not _VALID_MULT_RE.match(m_end)
+            if bad_start or bad_end:
+                bad_side = frm_disp if bad_start else to_disp
+                bad_val  = m_start if bad_start else m_end
+                errors.append({
+                    "error_type": "INVALID_MULTIPLICITY", "severity": "ERROR",
+                    "element": f"{frm_disp} \u2192 {to_disp}",
+                    "description": (f"Multiplicity '{bad_val}' on the '{bad_side}' side of "
+                                     f"'{frm_disp}' \u2192 '{to_disp}' is not a valid UML multiplicity."),
+                    "suggestion": "Use a valid format such as '1', '0..1', '*', '0..*', or '1..*'.",
+                    "auto_fix": {"fixable": False},
+                })
+
+        # ── MISSING_ASSOCIATION_NAME — unconditional, independent of multiplicity ──
+        label = str(s.get("relationship_label") or "").strip()
+        if not label:
+            text = str(s.get("text") or "").strip()
+            if "|" in text:
+                parts = text.split("|")
+                if len(parts) >= 2:
+                    label = parts[1].strip()
+        if not label:
+            suggested = _suggest_relationship_label(scenario, frm_disp, to_disp)
+            if suggested:
+                errors.append({
+                    "error_type": "MISSING_ASSOCIATION_NAME", "severity": "ERROR",
+                    "element": f"{frm_disp} \u2192 {to_disp}",
+                    "description": "Association Name is required",
+                    "suggestion": (
+                        f"Add '{suggested}' as the label at the midpoint of the line "
+                        f"between '{frm_disp}' and '{to_disp}' (based on the scenario)."
+                    ),
+                    "auto_fix": {"fixable": True, "action": "add_label",
+                                 "from_element": frm_disp, "to_element": to_disp,
+                                 "name": suggested},
+                })
+            else:
+                errors.append({
+                    "error_type": "MISSING_ASSOCIATION_NAME", "severity": "ERROR",
+                    "element": f"{frm_disp} \u2192 {to_disp}",
+                    "description": "Association Name is required",
+                    "suggestion": (
+                        f"Add a name label at the midpoint of the line between "
+                        f"'{frm_disp}' and '{to_disp}', e.g. a verb describing "
+                        f"their relationship (e.g. 'manages', 'has a')."
+                    ),
+                    "auto_fix": {"fixable": False},
+                })
+
     return errors
 
 
@@ -553,12 +1072,12 @@ def _rule_check_sequence(shapes: List[Dict]) -> List[Dict]:
     return errors
 
 
-def _run_rule_checks(shapes: List[Dict], diagram_type: str) -> List[Dict]:
+def _run_rule_checks(shapes: List[Dict], diagram_type: str, scenario: str = "") -> List[Dict]:
     dt = diagram_type.lower()
     if "usecase" in dt or "use_case" in dt or "use case" in dt:
         return _rule_check_usecase(shapes)
     elif "class" in dt:
-        return _rule_check_class(shapes)
+        return _rule_check_class(shapes, scenario)
     elif "sequence" in dt:
         return _rule_check_sequence(shapes)
     return []
@@ -650,19 +1169,21 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
     - ignored_errors: list of error fingerprints that user has dismissed — never re-report them.
     """
     SKIP_FROM_LLM = {
-        "disconnected_actor", "isolated_use_case",
         "wrong_class_capitalisation", "wrong_capitalisation",
         "wrong_actor_capitalisation", "wrong_use_case_capitalisation",
         "duplicate_actor", "duplicate_use_case", "duplicate_class",
         "unlabelled_actor", "unlabelled_use_case", "unlabelled_lifeline",
         "empty_class_name",
+        "disconnected_actor", "isolated_use_case",  # handled by rule engine above
+        "missing_multiplicity", "invalid_multiplicity",  # handled by rule engine above
+        "missing_association_name",  # handled by rule engine above
+        "missing_noun",  # handled by rule engine above
         # Self-referential / actor-connection hallucinations
         "self_referential_relationship", "incorrect_self_referential_relationship",
         "self_referential", "incorrect_self_reference",
         "incorrect_relationship", "incorrect_actor_relationship",
         "actor_self_relationship", "invalid_relationship",
-        # WRONG_MULTIPLICITY: LLM flip-flops between two valid values — skip entirely.
-        "wrong_multiplicity",
+        # wrong_multiplicity is now ENABLED — removed from skip list
     }
 
     existing      = _existing_names(clean_shapes)
@@ -925,6 +1446,7 @@ Examples of semantically equivalent descriptions:
 12. EMPTY_CLASS_NAME          — Class has no name or placeholder like "Class 1".
 13. SELF_ASSOCIATION          — Class connected to itself (warn unless scenario says so).
 14. SPELLING_MISTAKE          — A class name closely resembles a scenario class name but is misspelled (e.g. "Custmer" instead of "Customer"). ONE error only — do NOT also report MISSING_CLASS or EXTRA_CLASS for the same element.
+15. WRONG_ASSOCIATION_LABEL   — An association/aggregation/composition arrow HAS a label, but that label does not match what the scenario describes for that relationship. ALWAYS include the correct word/phrase taken directly from the scenario in the "suggestion" field.
 
 ## SEVERITY
 ERROR = must fix | WARNING = should fix | INFO = suggestion
@@ -951,6 +1473,7 @@ AUTO-FIX RULES:
 - MISSING_MULTIPLICITY → fixable: true, action: add_label, from_element, to_element, multiplicity_from, multiplicity_to
 - WRONG_MULTIPLICITY → fixable: true, action: add_label, from_element, to_element, multiplicity_from: <correct>, multiplicity_to: <correct>
 - MISSING_ASSOCIATION_LABEL → fixable: true, action: add_label, from_element, to_element, name: <label>
+- WRONG_ASSOCIATION_LABEL → fixable: true, action: add_label, from_element, to_element, name: <correct label from scenario>
 - WRONG_INHERITANCE_DIRECTION → fixable: false
 - CIRCULAR_INHERITANCE → fixable: false
 - EXTRA_CLASS → fixable: false
@@ -1005,10 +1528,20 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: NEVER report MISSING_MULTIPLICITY for an arrow that has multiplicity_start or multiplicity_end set, even if only one side has a value.
 - STRICT: Do NOT suggest a specific multiplicity value (like "1 to *") unless the scenario explicitly states it.
 
-### WRONG_MULTIPLICITY:
-- STRICT: Do NOT report WRONG_MULTIPLICITY at all. This check is disabled.
-- STRICT: Even if multiplicity values seem incorrect, DO NOT report WRONG_MULTIPLICITY.
-- STRICT: Multiplicity correctness is validated separately — skip all WRONG_MULTIPLICITY checks entirely.
+### WRONG_MULTIPLICITY (WARNING) ← ALWAYS CHECK:
+- Check EVERY association, aggregation, and composition arrow that HAS multiplicity values.
+- Look at multiplicity_start and multiplicity_end fields in each arrow shape.
+- Compare drawn multiplicity against what the scenario describes.
+- Examples of wrong multiplicity:
+  * Scenario: "one customer places many orders" → must be "1" on Customer side, "*" on Order side.
+    If drawn as "*" on both sides → WRONG_MULTIPLICITY.
+  * Scenario: "a student enrolls in many courses, a course has many students" → must be "* " on both sides.
+    If drawn as "1" on either side → WRONG_MULTIPLICITY.
+- Report element as "ClassA → ClassB" using from/to fields of the arrow.
+- description: "Multiplicity 'X' on ClassA end should be 'Y' based on scenario."
+- auto_fix: fixable: true, action: update_multiplicity, from_element, to_element, multiplicity_from: "correct", multiplicity_to: "correct"
+- STRICT: Only report if scenario CLEARLY states cardinality (one-to-many, many-to-many etc).
+- STRICT: Do NOT guess — only report when you are certain.
 
 ### MISSING_ATTRIBUTE / MISSING_METHOD:
 - STRICT: ONLY report MISSING_ATTRIBUTE if the scenario EXPLICITLY lists specific attributes for a class (e.g. "Customer has attributes: name, email, phone").
@@ -1018,9 +1551,27 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: If the scenario does NOT list attributes/methods → NO error, regardless of what user draws.
 - STRICT: Extra attributes/methods that are NOT in the scenario but user adds → NO error (user can add more than scenario requires).
 
-### MISSING_ASSOCIATION_LABEL:
-- STRICT: Only report if scenario EXPLICITLY mentions what the relationship should be called (e.g. "Bank manages Customer" → label is "manages").
-- STRICT: If scenario does not name the relationship, do NOT report missing label.
+### MISSING_ASSOCIATION_LABEL (WARNING) ← CHECK THIS:
+- Check EVERY association, aggregation, and composition arrow in the diagram.
+- Look at the relationship_label field AND the text field of each arrow.
+- If the scenario uses a VERB to describe the relationship (e.g. "Bank manages Customer", "Teacher teaches Student") AND the drawn arrow has NO label → report MISSING_ASSOCIATION_LABEL as WARNING.
+- element: "ClassA → ClassB"
+- description: "Association between ClassA and ClassB is missing a label."
+- suggestion: "Add label 'verb' to the arrow between ClassA and ClassB."
+- auto_fix: fixable: true, action: add_label, from_element: "ClassA", to_element: "ClassB", label: "<verb from scenario>"
+- STRICT: Only report when scenario explicitly describes the relationship with a verb.
+- STRICT: If scenario does not name the relationship → do NOT report.
+
+### WRONG_ASSOCIATION_LABEL (WARNING) ← CHECK THIS:
+- Check EVERY association, aggregation, and composition arrow that HAS a label.
+- If the drawn label does NOT match what the scenario describes → report WRONG_ASSOCIATION_LABEL as WARNING.
+- Example: scenario says "Bank manages Customer" but arrow label says "owns" → WRONG_ASSOCIATION_LABEL.
+- Example: scenario says "Teacher teaches Student" but arrow label says "trains" → WRONG_ASSOCIATION_LABEL.
+- description: "Label 'X' on arrow ClassA → ClassB should be 'Y' based on scenario."
+- suggestion: ALWAYS state the exact correct word/phrase from the scenario, e.g. "Change label 'X' to 'Y' as described in the scenario."
+- auto_fix: fixable: true, action: add_label, from_element: "ClassA", to_element: "ClassB", label: "<correct label>"
+- STRICT: Only report when scenario explicitly names the relationship AND drawn label is clearly different.
+- STRICT: Minor variations (e.g. "manage" vs "manages") are acceptable — do NOT report.
 
 ### General:
 - STRICT: When in doubt about ANY error, SKIP it.
@@ -1063,6 +1614,8 @@ checking is done by a separate rule-based system — do NOT repeat those checks.
 DO NOT CHECK AND DO NOT REPORT:
 - DISCONNECTED_ACTOR (handled by rule system)
 - ISOLATED_USE_CASE (handled by rule system)
+- UNLABELLED_USE_CASE (handled by rule system)
+- WRONG_ACTOR_NAME / actor-noun checks (handled by rule system — do NOT report this yourself, it is unreliable from an image/shape read and duplicates the rule engine)
 - DUPLICATE_ACTOR / DUPLICATE_USE_CASE (handled by rule system)
 - UNLABELLED_ACTOR / UNLABELLED_USE_CASE (handled by rule system)
 - Any capitalisation errors — case differences are NEVER errors
@@ -1070,6 +1623,15 @@ DO NOT CHECK AND DO NOT REPORT:
 - INCORRECT_RELATIONSHIP between two actors — actor-to-actor relationships are NEVER an error in use case diagrams
 - INCORRECT_RELATIONSHIP or INVALID_RELATIONSHIP of any kind — these error types do not exist in use case diagrams
 - WRONG_MULTIPLICITY — multiplicity does not apply to use case diagrams
+
+## SEMANTIC MATCHING — CRITICAL, AVOID FALSE POSITIVES
+- Before reporting MISSING_USE_CASE, MISSING_ACTOR, EXTRA_USE_CASE, or EXTRA_ACTOR, compare meaning, not just exact words.
+- "Manage Products" ≈ "Add Product" / "Edit Product" / "Browse Products" if the scenario describes that capability in different wording — treat as a MATCH, not missing/extra.
+- Synonyms count as matches: "Place Order" ≈ "Order Product", "Make Payment" ≈ "Pay", "Track Deliveries" ≈ "Track Delivery" ≈ "View Delivery Status".
+- Singular/plural differences are NEVER errors: "Product" == "Products".
+- Only report MISSING_USE_CASE/MISSING_ACTOR if the scenario clearly describes a capability/role that has NO reasonable equivalent anywhere in the diagram.
+- Only report EXTRA_USE_CASE/EXTRA_ACTOR if the diagram element has NO reasonable connection to anything described in the scenario.
+- If you are not confident an element is truly missing or truly extra, DO NOT report it — under-reporting is better than a false positive.
 
 ## CASE-INSENSITIVE MATCHING — ABSOLUTE RULE
 - ALL name matching is 100% CASE-INSENSITIVE.
@@ -1491,7 +2053,7 @@ def validate_with_openai(
     _log.info("Sanitized shapes: %d → %d (diagram: %s)", len(shapes), len(clean_shapes), diagram_type)
 
     # Step 2 — Run deterministic rule-based checks (connections, duplicates, empty names)
-    rule_errors = _run_rule_checks(clean_shapes, diagram_type)
+    rule_errors = _run_rule_checks(clean_shapes, diagram_type, scenario)
     _log.info("Rule checks: %d issues found", len(rule_errors))
 
     # Step 3 — Ask LLM only for scenario-semantic checks
@@ -1523,7 +2085,7 @@ def validate_with_openai(
             }
             if not auto_fix["fixable"]:
                 auto_fix = _build_fallback_fix(
-                    str(e.get("error_type", "")), str(e.get("element", "")), e, diagram_type)
+                    str(e.get("error_type", "")), str(e.get("element", "")), e, diagram_type, scenario)
             item = {
                 "error_type":  str(e.get("error_type", "UNKNOWN")),
                 "severity":    sev,
@@ -1585,10 +2147,11 @@ def _build_image_prompt(diagram_type: str, scenario: str) -> str:
 7. MISSING_SYSTEM_BOUNDARY — System boundary box is entirely absent. Only report if you CANNOT SEE any rectangle/box enclosing use cases.
 8. WRONG_SYSTEM_BOUNDARY_NAME — Boundary EXISTS but its label doesn't match scenario system name. Say "change name from X to Y" — never say "add a new boundary".
 9. WRONG_RELATIONSHIP — include/extend/generalization used incorrectly.
-10. MISSING_VERB_IN_USE_CASE — Use case name missing action verb.
+10. MISSING_VERB_IN_USE_CASE — Use case oval label must follow the 'Verb + Noun' format ONLY — a single action verb followed by a single noun/object (e.g. "Manage Order", "Place Order", "Browse Products"). Flag this if the label is missing a verb, missing a noun, or has extra words beyond verb + noun.
 11. DUPLICATE_ACTOR — Same actor name appears twice.
 12. DUPLICATE_USE_CASE — Same use case name appears twice.
 13. SPELLING_MISTAKE   — An actor or use case name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_ACTOR/MISSING_USE_CASE or EXTRA_ACTOR/EXTRA_USE_CASE for the same element.
+14. WRONG_ACTOR_NAME — Actor names must be nouns/roles (e.g. "Customer", "Admin", "Bank", "System"), never verbs/actions (e.g. "Login", "Register", "Manage", "Browse", "Pay"). Flag any actor whose label is a verb/action.
 CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisation as missing/extra."""
         dtype_label = "USE CASE"
         extra_rules = """
@@ -1600,7 +2163,19 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 ## SYSTEM BOUNDARY NAME RULE:
 - If boundary EXISTS with wrong name → report WRONG_SYSTEM_BOUNDARY_NAME, suggest renaming.
 - If boundary does NOT exist → report MISSING_SYSTEM_BOUNDARY.
-- Never report both for the same diagram."""
+- Never report both for the same diagram.
+
+## USE CASE NAMING FORMAT RULE — CRITICAL:
+- A valid use case label is EXACTLY "Verb + Noun" — two parts only (e.g. "Manage Order").
+- Do NOT require or expect a third word or a trailing verb. "Verb + Noun + Verb" is NOT the rule.
+- If the label has only a verb, only a noun, or more than a verb+noun pair, report MISSING_VERB_IN_USE_CASE.
+- suggestion: "Rename 'X' to a verb + noun, e.g. 'Manage X' or 'Process X'."
+
+## ACTOR NAME FORMAT RULE — CRITICAL:
+- Actor labels must be nouns/roles, never verbs/actions.
+- If an actor label is a verb/action → report WRONG_ACTOR_NAME as WARNING.
+- description: "Actor names must represent roles or entities, not actions."
+- suggestion: "Rename actor to a proper role name like 'Customer' or 'Admin'." """
 
     elif "sequence" in dt:
         rules = """1. MISSING_LIFELINE — Every participant in scenario must have a lifeline or object box.
@@ -1630,22 +2205,38 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 - Only report WRONG_MESSAGE_ORDER if you are 100% certain. When in doubt → SKIP."""
 
     else:
-        rules = """1. MISSING_CLASS — Important nouns in scenario must be class boxes. Only explicitly named entities.
-2. EXTRA_CLASS — Class not in scenario (warning).
-3. WRONG_CLASS_CAPITALISATION — Class starts with lowercase. Suggest capitalising. Do NOT say remove it.
-4. WRONG_RELATIONSHIP_TYPE — Wrong arrow type used.
-5. MISSING_RELATIONSHIP — Relationship EXPLICITLY in scenario but not drawn. Do NOT invent relationships.
-6. MISSING_MULTIPLICITY — Association arrow drawn but multiplicity labels are absent.
-7. WRONG_MULTIPLICITY — Multiplicity present but value differs from scenario.
-8. MISSING_ASSOCIATION_LABEL — Scenario names a label for a relationship but it's not on the arrow.
-9. EMPTY_CLASS_NAME — Class has no name or placeholder like "Class 1".
-10. SPELLING_MISTAKE — A class name closely resembles a scenario class name but is misspelled (e.g. "Custmer" vs "Customer"). ONE error only — do NOT also report MISSING_CLASS or EXTRA_CLASS for the same element."""
+        rules = """1. MISSING_CLASS              — Important nouns in scenario must be classes. Only explicitly named entities.
+2. EXTRA_CLASS                — Class in diagram not mentioned in scenario (warning).
+3. WRONG_CLASS_CAPITALISATION — Class name exists but starts with lowercase — suggest capitalising, never suggest removing.
+4. WRONG_RELATIONSHIP_TYPE    — Wrong arrow type vs scenario (association/aggregation/composition/generalization).
+5. MISSING_RELATIONSHIP       — Relationship EXPLICITLY described in scenario but not drawn.
+6. MISSING_MULTIPLICITY       — Association/aggregation/composition arrow drawn but both multiplicity fields are empty.
+7. WRONG_MULTIPLICITY         — Multiplicity present but value is wrong vs scenario.
+8. MISSING_ASSOCIATION_LABEL  — Scenario names a label for a relationship but it is not on the drawn arrow.
+9. WRONG_INHERITANCE_DIRECTION — Inheritance arrow reversed (child should point TO parent).
+10. DUPLICATE_CLASS           — Same class name appears twice.
+11. CIRCULAR_INHERITANCE      — A inherits B and B inherits A.
+12. EMPTY_CLASS_NAME          — Class has no name or placeholder like "Class 1".
+13. SELF_ASSOCIATION          — Class connected to itself (warn unless scenario says so).
+14. SPELLING_MISTAKE          — A class name closely resembles a scenario class name but is misspelled (e.g. "Custmer" instead of "Customer"). ONE error only — do NOT also report MISSING_CLASS or EXTRA_CLASS for the same element.
+15. WRONG_ASSOCIATION_LABEL   — An association/aggregation/composition arrow HAS a visible label, but that label does not match what the scenario describes for that relationship. ALWAYS include the correct word/phrase taken directly from the scenario in the "suggestion" field."""
         dtype_label = "CLASS"
         extra_rules = """
+## RELATIONSHIP TYPE VALIDATION:
+- If scenario says "is a" / "inherits" / "type of" / "kind of" → expect GENERALIZATION.
+- If scenario says "consists of" / "composed of" / "cannot exist without" → expect COMPOSITION.
+- If scenario says "contains" / "collection of" / "holds" / "is made up of" → expect AGGREGATION.
+- If scenario says "has" / "uses" / "is related to" / "is associated with" → expect ASSOCIATION.
+- Wrong type drawn → report WRONG_RELATIONSHIP_TYPE.
+
 ## CLASS CAPITALISATION RULE:
 - If a class "customer" exists and scenario has "Customer" → report WRONG_CLASS_CAPITALISATION.
 - Suggestion: "Capitalise the first letter: rename 'customer' to 'Customer'."
 - Do NOT report it as EXTRA_CLASS or say to remove it.
+
+## SPELLING MISTAKE RULE:
+- If a class name looks like a misspelling of a scenario class name (e.g. "Custmer" vs "Customer") → report EXACTLY ONE SPELLING_MISTAKE error.
+- Do NOT also report MISSING_CLASS for the correctly-spelled version or EXTRA_CLASS for the misspelled version.
 
 ## RELATIONSHIP RULE:
 - Only report MISSING_RELATIONSHIP if scenario EXPLICITLY states a relationship (has, contains, inherits, etc.).
@@ -1653,7 +2244,33 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 
 ## MISSING LABEL RULE:
 - Only report MISSING_ASSOCIATION_LABEL if scenario names what the relationship should be called.
-- If scenario does not name the relationship → labels are optional."""
+- If scenario does not name the relationship → labels are optional.
+
+## WRONG ASSOCIATION LABEL RULE — CRITICAL:
+- Check every association/aggregation/composition arrow that HAS a visible label.
+- If the drawn label does NOT match what the scenario describes for that relationship → report WRONG_ASSOCIATION_LABEL as a WARNING.
+- Example: scenario says "Bank manages Customer" but arrow label reads "owns" → WRONG_ASSOCIATION_LABEL.
+- suggestion: ALWAYS name the exact correct word/phrase from the scenario, e.g. "Change label 'owns' to 'manages' as described in the scenario."
+- Minor wording variations (e.g. "manage" vs "manages") are acceptable — do NOT report those.
+
+## MULTIPLICITY RULES:
+- If a multiplicity value is visible at EITHER end of an association/aggregation/composition arrow → multiplicity EXISTS, do NOT report MISSING_MULTIPLICITY.
+- Only report MISSING_MULTIPLICITY if BOTH ends genuinely show no multiplicity value.
+- WRONG_MULTIPLICITY: only report if the scenario CLEARLY states cardinality (one-to-many, many-to-many, etc.) and the drawn values contradict it.
+- Do NOT suggest a specific multiplicity value unless the scenario explicitly states it.
+
+## INHERITANCE RULES:
+- WRONG_INHERITANCE_DIRECTION — the arrow should point FROM the child class TO the parent class; flag if reversed.
+- CIRCULAR_INHERITANCE — flag if A inherits from B and B inherits from A.
+
+## DUPLICATE / EMPTY / SELF-ASSOCIATION:
+- DUPLICATE_CLASS — same class name appears twice in the image.
+- EMPTY_CLASS_NAME — a class box has no visible name or a placeholder like "Class 1".
+- SELF_ASSOCIATION — a class connects to itself; only flag as a WARNING unless the scenario explicitly describes this.
+
+## MISSING_ATTRIBUTE / MISSING_METHOD:
+- Only report if the scenario EXPLICITLY lists specific attributes or methods for a class.
+- If the scenario does not list them, do NOT report anything missing, regardless of what is drawn."""
 
     return f"""You are an expert UML {dtype_label} Diagram validator using SEMANTIC analysis. You are given an IMAGE of the diagram.
 
@@ -1692,6 +2309,9 @@ For each error, provide an "auto_fix" object. Set "fixable": true only for these
 - SPELLING_MISTAKE → action: "rename_shape", name: <correct spelling from scenario>, fixable: true
 - DISCONNECTED_ACTOR / ISOLATED_USE_CASE → action: "add_arrow", from_element, to_element, arrow_type: "association"
 - MISSING_MULTIPLICITY → action: "add_label", from_element, to_element, multiplicity_from, multiplicity_to
+- MISSING_VERB_IN_USE_CASE → action: "rename_shape", name: <corrected name with verb + noun only>, fixable: true
+- WRONG_ASSOCIATION_LABEL → action: "add_label", from_element, to_element, label: <correct label from scenario>, fixable: true
+- WRONG_ACTOR_NAME → fixable: false
 All other errors → fixable: false
 
 ## RESPONSE FORMAT (JSON only, no markdown)
@@ -1850,7 +2470,7 @@ def validate_with_openai_image(
                 element    = str(e.get("element",    ""))
 
                 if not auto_fix.get("fixable"):
-                    auto_fix = _build_fallback_fix(error_type, element, e, diagram_type)
+                    auto_fix = _build_fallback_fix(error_type, element, e, diagram_type, scenario)
 
                 item = {
                     "error_type":  error_type,
@@ -1902,4 +2522,3 @@ def validate_with_openai_image(
 
     _log.error("All Vision models failed!")
     return None
-
