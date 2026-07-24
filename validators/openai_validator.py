@@ -1436,7 +1436,10 @@ Examples of semantically equivalent descriptions:
 - Class names MUST start with an uppercase letter in UML. Lowercase first letter = capitalisation error only.
 
 ## SPELLING MISTAKE RULES — CRITICAL:
-- If a class name in the diagram looks like a misspelling of a class name in the scenario (e.g. "Custmer" vs "Customer", "Odrr" vs "Order"):
+- SPELLING_MISTAKE applies ONLY when a class IS ACTUALLY DRAWN on the canvas and its name is a NEAR-IDENTICAL misspelling of a scenario class name — differing by only 1-2 letters, a swapped letter, or one missing/extra letter, and clearly the same word (e.g. "Custmer" vs "Customer", "Odrr" vs "Order").
+- Do NOT treat two names as a "spelling mistake" match just because they are both nouns in the same domain or start with the same letter. If the drawn name and the scenario name do not share almost all the same letters in the same order, they are NOT a spelling match.
+- If a scenario class has NO drawn class whose name is a near-identical match by the rule above — including when it was never drawn at all — you MUST report MISSING_CLASS for it. NEVER invent a SPELLING_MISTAKE against some unrelated existing class name just to explain the gap.
+- When SPELLING_MISTAKE genuinely applies (per the strict criteria above):
   → Report EXACTLY ONE error of type SPELLING_MISTAKE.
   → element: the misspelled name as drawn.
   → description: "Class name 'X' appears to be a misspelling of 'Y' from the scenario."
@@ -1532,7 +1535,9 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: Only report for nouns EXPLICITLY written as class names in the scenario.
 - STRICT: Method names like "submitOrder()" are METHODS, never classes.
 - STRICT: Attribute names like "orderId", "price" are ATTRIBUTES, never classes.
-- STRICT: If a class name in the diagram is a close misspelling of a scenario class → report SPELLING_MISTAKE ONLY, NOT MISSING_CLASS.
+- STRICT: If a class name in the diagram is a close misspelling (near-identical, 1-2 letters off) of a scenario class → report SPELLING_MISTAKE ONLY, NOT MISSING_CLASS.
+- STRICT: For EVERY class explicitly named in the scenario, go through the diagram's class list one by one. If none of the drawn class names is a near-identical spelling match, that scenario class was NOT drawn at all → you MUST report MISSING_CLASS for it. Do NOT skip this just because some other, unrelated class exists in the diagram.
+- STRICT: A completely different or unrelated class name already present in the diagram does NOT excuse a scenario class from being reported as MISSING_CLASS.
 
 ### MISSING_RELATIONSHIP:
 - STRICT: Only report if scenario EXPLICITLY uses trigger words: has, contains, inherits, is a type of, consists of, is composed of, manages, holds, etc.
@@ -2257,8 +2262,24 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 - Do NOT report it as EXTRA_CLASS or say to remove it.
 
 ## SPELLING MISTAKE RULE:
-- If a class name looks like a misspelling of a scenario class name (e.g. "Custmer" vs "Customer") → report EXACTLY ONE SPELLING_MISTAKE error.
-- Do NOT also report MISSING_CLASS for the correctly-spelled version or EXTRA_CLASS for the misspelled version.
+- SPELLING_MISTAKE applies ONLY when a class box IS VISIBLE in the image and its name is a NEAR-IDENTICAL misspelling of a scenario class name — differing by only 1-2 letters and clearly the same word (e.g. "Custmer" vs "Customer"). Do NOT match names that are merely related in topic or share a starting letter.
+- If a scenario class has no class box in the image with a near-identical name (including when that class box does not exist at all) → you MUST report MISSING_CLASS. Go through each scenario class one by one and check it against every visible class box before deciding. Do NOT report SPELLING_MISTAKE against an unrelated class box just to explain the gap.
+- When SPELLING_MISTAKE genuinely applies: report EXACTLY ONE SPELLING_MISTAKE error and do NOT also report MISSING_CLASS for the correctly-spelled version or EXTRA_CLASS for the misspelled version.
+
+## DUPLICATE_CLASS RULE — ALWAYS CHECK:
+- Scan every class box name in the image against every other class box name.
+- If the SAME class name (case-insensitive) appears in two or more separate boxes → report DUPLICATE_CLASS as an ERROR for that class name.
+- element: the repeated class name. description: "Class 'X' appears more than once in the diagram." suggestion: "Remove or merge the duplicate 'X' class."
+
+## MISSING_ASSOCIATION_LABEL RULE — ALWAYS CHECK:
+- Look at every association/aggregation/composition line/arrow in the image.
+- If the scenario describes that relationship with a verb (e.g. "Bank manages Customer", "Teacher teaches Student") and the drawn line has NO visible text label → report MISSING_ASSOCIATION_LABEL as a WARNING, even if you are also checking other things about that same arrow.
+- Do not skip this check just because the arrow itself is present and correctly connects the two classes — connection alone does not satisfy the label requirement.
+
+## WRONG_ASSOCIATION_LABEL RULE — ALWAYS CHECK:
+- Look at every association/aggregation/composition line/arrow that DOES have a visible text label.
+- Compare the visible label word-for-word (allowing minor wording variants like "manage" vs "manages") against what the scenario says that relationship should be.
+- If they clearly differ in meaning → report WRONG_ASSOCIATION_LABEL as a WARNING, and always state the exact correct word/phrase from the scenario in the suggestion.
 
 ## RELATIONSHIP RULE:
 - Only report MISSING_RELATIONSHIP if scenario EXPLICITLY states a relationship (has, contains, inherits, etc.).
