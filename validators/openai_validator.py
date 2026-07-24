@@ -45,6 +45,24 @@ _SYSTEM_MESSAGE = (
     "Return valid JSON only — no markdown, no prose."
 )
 
+# Used ONLY for image-based (canvas-less) validation. There is NO deterministic
+# rule engine running alongside image validation (no shape/coordinate data is
+# available), so — unlike the shape-mode system message above — this one must
+# NOT tell the model to skip DISCONNECTED_ACTOR / ISOLATED_USE_CASE / empty
+# labels / missing associations. If it does, those errors are never reported
+# by anyone and silently disappear from image validation results.
+_SYSTEM_MESSAGE_IMAGE = (
+    "You are a strict, deterministic UML diagram validator. "
+    "ALL name matching is CASE-INSENSITIVE — 'login' and 'Login' are identical. "
+    "NEVER report missing/extra elements due to capitalisation differences. "
+    "There is NO separate rule engine for this image-based validation — YOU are the "
+    "only checker, so you MUST check EVERY rule listed below yourself, including "
+    "DISCONNECTED_ACTOR, ISOLATED_USE_CASE, EMPTY_USE_CASE_LABEL, MISSING_ASSOCIATION_LABEL, "
+    "and WRONG_ASSOCIATION_LABEL — do not skip these assuming something else checks them. "
+    "Only report scenario-based structural errors you are 100% certain about. "
+    "Return valid JSON only — no markdown, no prose."
+)
+
 
 def _get_api_key() -> Optional[str]:
     key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -651,40 +669,42 @@ def _rule_check_usecase(shapes: List[Dict]) -> List[Dict]:
                     })
 
     # ── Blank/Empty Use Case check ──────────────────────────────────────────
-    # The UNLABELLED_USE_CASE check above already catches shapes with no text.
-    # This pass catches shapes whose label is a default/placeholder value like
-    # "Use Case" or "usecase" that slipped through (non-empty but meaningless).
-    # NOTE: operates on `shapes` (the already-sanitized clean_shapes list passed in)
-    # so type is already "use_case_oval" after _sanitize_shapes().
-    _placeholder_labels = {"use case", "usecase", "oval", "ellipse", "new use case"}
+    # Check every use case oval — if it has no text → EMPTY_USE_CASE_LABEL error
     for s in shapes:
-        if s.get("type") != "use_case_oval":
-            continue
-        name = _shape_name(s)
-        n = _n(name)
-        # Skip: already flagged as UNLABELLED (empty) or as a real labelled use case
-        if not n:
-            continue  # already caught by UNLABELLED_USE_CASE above
-        if n in _placeholder_labels:
-            errors.append({
-                "error_type": "EMPTY_USE_CASE_LABEL", "severity": "ERROR",
-                "element": name,
-                "description": f"Use case oval has a placeholder label '{name}'. Give it a real action name.",
-                "suggestion": "Replace the placeholder with a meaningful use case name e.g. 'Place Order', 'Browse Products'.",
-                "auto_fix": {"fixable": False},
-            })
+        t = s.get("type", "").lower()
+        if "usecase" in t or "use_case" in t or "oval" in t or "ellipse" in t:
+            label = str(s.get("text", "") or s.get("label", "") or s.get("name", "") or "").strip()
+            if not label or label.lower() in ("", "none", "null", "undefined", "use case", "usecase"):
+                errors.append({
+                    "error_type": "EMPTY_USE_CASE_LABEL", "severity": "ERROR",
+                    "element": "Unlabelled use case",
+                    "description": "A use case oval has no label or an empty name.",
+                    "suggestion": "Give this use case a meaningful name e.g. 'Place Order', 'Browse Products'.",
+                    "auto_fix": {"fixable": False},
+                })
 
     # ── Connection checking (name-based + geometry-based) ──────────────────
     # Method 1: name-based — arrow shapes that carry explicit from/to (or
     # equivalent) fields naming the connected elements.
     connected = set()
+    all_names = {*actors.keys(), *use_cases.keys()}
     for s in shapes:
         t = s.get("type", "")
         if any(k in t for k in ("arrow", "line", "association", "connector")):
-            for key in ("from", "to", "startShape", "endShape", "source", "target"):
-                val = _n(str(s.get(key) or ""))
-                if val:
+            frm = _arrow_endpoint(s, "from")
+            to  = _arrow_endpoint(s, "to")
+            for val in (frm, to):
+                if not val:
+                    continue
+                if val in all_names:
                     connected.add(val)
+                else:
+                    # Fuzzy fallback: minor whitespace/punctuation differences
+                    # between the arrow's from/to value and the shape's actual
+                    # label shouldn't cause a real connection to be missed.
+                    for candidate in all_names:
+                        if candidate and (candidate in val or val in candidate):
+                            connected.add(candidate)
 
     # Method 2: geometry-based (ported from usecase_validator.py) — a shape is
     # "connected" if any line's endpoint (position / position+endPosition)
@@ -857,6 +877,46 @@ def _suggest_relationship_label(scenario: str, name_a: str, name_b: str) -> Opti
     return None
 
 
+_MISSING_CLASS_STOPWORDS = {
+    "the", "a", "an", "this", "that", "these", "those", "it", "he", "she",
+    "they", "we", "you", "i", "system", "user", "each", "every", "all",
+    "some", "any", "one", "when", "if", "then", "and", "or", "but", "so",
+    "also", "then", "which", "who", "whom", "what", "where", "how", "why",
+}
+
+
+def _find_missing_classes(scenario: str, class_names: Dict[str, str]) -> List[str]:
+    """
+    Conservative, deterministic MISSING_CLASS detector: scans the scenario for
+    capitalised entity-like words that appear 2+ times (so a one-off sentence-
+    initial capital doesn't false-positive) and are not already represented by
+    a class in the diagram (fuzzy/stem match). Returns display names to flag.
+    This is a SAFETY NET alongside the LLM's own MISSING_CLASS check — it
+    only adds errors the LLM missed, it never removes any.
+    """
+    if not scenario:
+        return []
+    words = re.findall(r"\b[A-Z][a-zA-Z]*\b", scenario)
+    counts: Dict[str, int] = {}
+    display: Dict[str, str] = {}
+    for w in words:
+        lw = w.lower()
+        if lw in _MISSING_CLASS_STOPWORDS:
+            continue
+        counts[lw] = counts.get(lw, 0) + 1
+        display.setdefault(lw, w)
+
+    existing_stems = {_stem(n) for n in class_names.keys()}
+    missing = []
+    for lw, cnt in counts.items():
+        if cnt < 2:
+            continue  # avoid sentence-initial-capital false positives
+        if _stem(lw) in existing_stems:
+            continue
+        missing.append(display[lw])
+    return missing
+
+
 def _rule_check_class(shapes: List[Dict], scenario: str = "") -> List[Dict]:
     """Deterministic rule checks for class diagrams."""
     errors = []
@@ -1006,6 +1066,16 @@ def _rule_check_class(shapes: List[Dict], scenario: str = "") -> List[Dict]:
                     ),
                     "auto_fix": {"fixable": False},
                 })
+
+    # ── MISSING_CLASS safety net (deterministic, in addition to the LLM) ──
+    for missing_name in _find_missing_classes(scenario, class_names):
+        errors.append({
+            "error_type": "MISSING_CLASS", "severity": "ERROR",
+            "element": missing_name,
+            "description": f"'{missing_name}' is mentioned in the scenario but has no matching class in the diagram.",
+            "suggestion": f"Add a class named '{missing_name}'.",
+            "auto_fix": {"fixable": True, "action": "add_shape", "shape_type": "class", "name": missing_name},
+        })
 
     return errors
 
@@ -1195,6 +1265,7 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
         "disconnected_actor", "isolated_use_case",  # handled by rule engine above
         "missing_multiplicity", "invalid_multiplicity",  # handled by rule engine above
         "missing_association_name",  # handled by rule engine above
+        "missing_class",  # handled by rule engine safety net above (canvas mode)
         "missing_noun",  # handled by rule engine above
         # Self-referential / actor-connection hallucinations
         "self_referential_relationship", "incorrect_self_referential_relationship",
@@ -1270,14 +1341,6 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
 
         # Drop if LLM says element is MISSING but it exists in shapes (hallucination)
         if "missing" in et and elem and elem in existing:
-            # Never suppress MISSING_CLASS — a class may exist under wrong capitalisation
-            # (caught as WRONG_CLASS_CAPITALISATION by rule engine) while the correctly-
-            # named class is genuinely absent. Suppressing this hides real errors.
-            # MISSING_ACTOR and MISSING_USE_CASE are already guarded by their own
-            # _scenario_mentions() block above — don't double-suppress them here.
-            if et in ("missing_class", "missing_actor", "missing_use_case"):
-                return True  # let GPT's semantic judgment stand
-
             # Allow MISSING_MULTIPLICITY / MISSING_RELATIONSHIP even if element name matches
             # ONLY if the relationship itself is NOT already in the diagram
             if et in ("missing_multiplicity", "missing_relationship",
@@ -1986,7 +2049,7 @@ def _call_model(prompt: str, api_key: str, model: str) -> Optional[Dict]:
         ],
         "temperature": 0,
         "seed": 42,
-        "max_tokens": 1500,
+        "max_tokens": 3000,
     }).encode("utf-8")
 
     req = urllib.request.Request(
@@ -2181,8 +2244,8 @@ def _build_image_prompt(diagram_type: str, scenario: str) -> str:
 2. EXTRA_ACTOR — Actor not mentioned in scenario (warning).
 3. MISSING_USE_CASE — Every action/function in scenario must be a use case oval.
 4. EXTRA_USE_CASE — Use case oval not in scenario (info).
-5. DISCONNECTED_ACTOR — Actor has NO line to any use case. A line touching ANY part of the actor (head, body, hands, feet) = CONNECTED. Only flag if truly no line exists near the actor.
-6. ISOLATED_USE_CASE — Use case has no connection to any actor.
+5. DISCONNECTED_ACTOR — [MANDATORY CHECK] Actor has NO line to any use case. A line touching ANY part of the actor (head, body, hands, feet) = CONNECTED. Only skip if you clearly see a line touching the actor; otherwise you MUST report it.
+6. ISOLATED_USE_CASE — [MANDATORY CHECK] Use case oval has no connection to any actor. Check EVERY use case oval individually — you MUST report every single one that has no line touching it, even if other use cases in the same diagram are connected.
 7. MISSING_SYSTEM_BOUNDARY — System boundary box is entirely absent. Only report if you CANNOT SEE any rectangle/box enclosing use cases.
 8. WRONG_SYSTEM_BOUNDARY_NAME — Boundary EXISTS but its label doesn't match scenario system name. Say "change name from X to Y" — never say "add a new boundary".
 9. WRONG_RELATIONSHIP — include/extend/generalization used incorrectly.
@@ -2191,13 +2254,23 @@ def _build_image_prompt(diagram_type: str, scenario: str) -> str:
 12. DUPLICATE_USE_CASE — Same use case name appears twice.
 13. SPELLING_MISTAKE   — An actor or use case name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_ACTOR/MISSING_USE_CASE or EXTRA_ACTOR/EXTRA_USE_CASE for the same element.
 14. WRONG_ACTOR_NAME — Actor names must be nouns/roles (e.g. "Customer", "Admin", "Bank", "System"), never verbs/actions (e.g. "Login", "Register", "Manage", "Browse", "Pay"). Flag any actor whose label is a verb/action.
+15. EMPTY_USE_CASE_LABEL — [MANDATORY CHECK] A use case oval that is blank / has no visible text inside it at all. This is DIFFERENT from MISSING_USE_CASE (a use case oval that IS present but empty must be flagged as EMPTY_USE_CASE_LABEL, not skipped).
 CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisation as missing/extra."""
         dtype_label = "USE CASE"
         extra_rules = """
 ## ACTOR CONNECTION RULE:
 - An actor stick-figure occupies vertical space (head, body, hands, feet).
 - Any line touching ANY part of the stick-figure = CONNECTED.
-- Only flag DISCONNECTED_ACTOR if there is genuinely no line anywhere near the actor.
+- Flag DISCONNECTED_ACTOR if there is genuinely no line anywhere near the actor — you MUST check this for every actor, do not skip it.
+
+## USE CASE CONNECTION RULE — CRITICAL, CHECK EVERY OVAL INDIVIDUALLY:
+- Go through EVERY use case oval in the image one at a time.
+- For each oval, check if ANY line/arrow touches its edge.
+- If an oval has zero lines touching it, you MUST report ISOLATED_USE_CASE for that oval — even if most other use cases in the diagram are correctly connected. Do not stop after finding the first isolated one; report ALL of them.
+
+## EMPTY USE CASE RULE — CRITICAL, CHECK EVERY OVAL INDIVIDUALLY:
+- For each use case oval, check whether it has visible text inside it.
+- If an oval is blank/empty, report EMPTY_USE_CASE_LABEL for it. Do this even if the oval is otherwise correctly connected to an actor.
 
 ## SYSTEM BOUNDARY NAME RULE:
 - If boundary EXISTS with wrong name → report WRONG_SYSTEM_BOUNDARY_NAME, suggest renaming.
@@ -2244,21 +2317,21 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 - Only report WRONG_MESSAGE_ORDER if you are 100% certain. When in doubt → SKIP."""
 
     else:
-        rules = """1. MISSING_CLASS              — Important nouns in scenario must be classes. Only explicitly named entities.
+        rules = """1. MISSING_CLASS              — [MANDATORY CHECK] Important nouns/entities explicitly named in scenario must be classes. Go through the scenario sentence by sentence and list every named entity, then check each one exists as a class box in the image; report MISSING_CLASS for any that don't.
 2. EXTRA_CLASS                — Class in diagram not mentioned in scenario (warning).
 3. WRONG_CLASS_CAPITALISATION — Class name exists but starts with lowercase — suggest capitalising, never suggest removing.
 4. WRONG_RELATIONSHIP_TYPE    — Wrong arrow type vs scenario (association/aggregation/composition/generalization).
 5. MISSING_RELATIONSHIP       — Relationship EXPLICITLY described in scenario but not drawn.
 6. MISSING_MULTIPLICITY       — Association/aggregation/composition arrow drawn but both multiplicity fields are empty.
 7. WRONG_MULTIPLICITY         — Multiplicity present but value is wrong vs scenario.
-8. MISSING_ASSOCIATION_LABEL  — Scenario names a label for a relationship but it is not on the drawn arrow.
+8. MISSING_ASSOCIATION_LABEL  — [MANDATORY CHECK] Go through EVERY association/aggregation/composition arrow in the image one at a time. If the scenario names what that relationship should be called and the arrow has NO visible label at all, report MISSING_ASSOCIATION_LABEL for it.
 9. WRONG_INHERITANCE_DIRECTION — Inheritance arrow reversed (child should point TO parent).
 10. DUPLICATE_CLASS           — Same class name appears twice.
 11. CIRCULAR_INHERITANCE      — A inherits B and B inherits A.
 12. EMPTY_CLASS_NAME          — Class has no name or placeholder like "Class 1".
 13. SELF_ASSOCIATION          — Class connected to itself (warn unless scenario says so).
 14. SPELLING_MISTAKE          — A class name closely resembles a scenario class name but is misspelled (e.g. "Custmer" instead of "Customer"). ONE error only — do NOT also report MISSING_CLASS or EXTRA_CLASS for the same element.
-15. WRONG_ASSOCIATION_LABEL   — An association/aggregation/composition arrow HAS a visible label, but that label does not match what the scenario describes for that relationship. ALWAYS include the correct word/phrase taken directly from the scenario in the "suggestion" field."""
+15. WRONG_ASSOCIATION_LABEL   — [MANDATORY CHECK] Go through EVERY association/aggregation/composition arrow that HAS a visible label one at a time, and compare that label's meaning against what the scenario describes for that specific relationship. If it does not match, report WRONG_ASSOCIATION_LABEL. ALWAYS include the correct word/phrase taken directly from the scenario in the "suggestion" field. Do not skip an arrow just because it has some label — a wrong label is still an error."""
         dtype_label = "CLASS"
         extra_rules = """
 ## RELATIONSHIP TYPE VALIDATION:
@@ -2281,12 +2354,13 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 - Only report MISSING_RELATIONSHIP if scenario EXPLICITLY states a relationship (has, contains, inherits, etc.).
 - Do NOT invent relationships just because two classes exist.
 
-## MISSING LABEL RULE:
-- Only report MISSING_ASSOCIATION_LABEL if scenario names what the relationship should be called.
-- If scenario does not name the relationship → labels are optional.
+## MISSING LABEL RULE — CRITICAL, CHECK EVERY ARROW INDIVIDUALLY:
+- Go through every association/aggregation/composition arrow one at a time and look for a text label near its midpoint.
+- If the scenario names what that relationship should be called AND the arrow has no visible label at all → report MISSING_ASSOCIATION_LABEL. You must check ALL arrows, not just the first one.
+- If scenario does not name the relationship → labels are optional for that specific arrow only.
 
-## WRONG ASSOCIATION LABEL RULE — CRITICAL:
-- Check every association/aggregation/composition arrow that HAS a visible label.
+## WRONG ASSOCIATION LABEL RULE — CRITICAL, CHECK EVERY ARROW INDIVIDUALLY:
+- Check EVERY association/aggregation/composition arrow that HAS a visible label — go one at a time, do not stop after the first.
 - If the drawn label does NOT match what the scenario describes for that relationship → report WRONG_ASSOCIATION_LABEL as a WARNING.
 - Example: scenario says "Bank manages Customer" but arrow label reads "owns" → WRONG_ASSOCIATION_LABEL.
 - suggestion: ALWAYS name the exact correct word/phrase from the scenario, e.g. "Change label 'owns' to 'manages' as described in the scenario."
@@ -2344,11 +2418,13 @@ For each error, provide an "auto_fix" object. Set "fixable": true only for these
 - MISSING_RETURN → action: "add_arrow", from_element, to_element, arrow_type: "dashed_arrow", message_label
 - MISSING_DELETION_SYMBOL → action: "add_shape", shape_type: "deletion_marker", name: <lifeline name>
 - EMPTY_CLASS_NAME / UNLABELLED_LIFELINE / UNLABELLED_OBJECT → action: "rename_shape", name
+- EMPTY_USE_CASE_LABEL → action: "rename_shape", name: <suggested name from scenario>, fixable: true
 - DUPLICATE_* → action: "merge_shapes", name
 - SPELLING_MISTAKE → action: "rename_shape", name: <correct spelling from scenario>, fixable: true
 - DISCONNECTED_ACTOR / ISOLATED_USE_CASE → action: "add_arrow", from_element, to_element, arrow_type: "association"
 - MISSING_MULTIPLICITY → action: "add_label", from_element, to_element, multiplicity_from, multiplicity_to
 - MISSING_VERB_IN_USE_CASE → action: "rename_shape", name: <corrected name with verb + noun only>, fixable: true
+- MISSING_ASSOCIATION_LABEL → action: "add_label", from_element, to_element, name: <correct label from scenario>, fixable: true
 - WRONG_ASSOCIATION_LABEL → action: "add_label", from_element, to_element, label: <correct label from scenario>, fixable: true
 - WRONG_ACTOR_NAME → fixable: false
 All other errors → fixable: false
@@ -2394,7 +2470,7 @@ def _call_model_with_image(prompt: str, image_b64: str, mime_type: str, api_key:
     payload = json.dumps({
         "model": model,
         "messages": [
-            {"role": "system", "content": _SYSTEM_MESSAGE},
+            {"role": "system", "content": _SYSTEM_MESSAGE_IMAGE},
             {
                 "role": "user",
                 "content": [
@@ -2405,7 +2481,7 @@ def _call_model_with_image(prompt: str, image_b64: str, mime_type: str, api_key:
         ],
         "temperature": 0,
         "seed": 42,
-        "max_tokens": 1500,
+        "max_tokens": 3000,
     }).encode("utf-8")
 
     req = urllib.request.Request(
