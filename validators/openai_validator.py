@@ -1635,7 +1635,7 @@ checking is done by a separate rule-based system — do NOT repeat those checks.
 5. MISSING_SYSTEM_BOUNDARY — No system boundary rectangle exists in the diagram at all.
 6. WRONG_SYSTEM_BOUNDARY_NAME — Boundary exists but label does not match scenario system name.
 7. WRONG_RELATIONSHIP — include/extend/generalization used incorrectly per scenario.
-8. SPELLING_MISTAKE   — An actor or use case name IS DRAWN but is a NEAR-IDENTICAL misspelling of a scenario name — differing by only 1-2 letters, a swapped letter, or one missing/extra letter, and clearly the same word (e.g. "Custmer" instead of "Customer"). Do NOT count two names as a spelling match just because they are topically related or share a starting letter. ONE error only — do NOT also report MISSING_ACTOR/MISSING_USE_CASE or EXTRA_ACTOR/EXTRA_USE_CASE for the same element.
+8. SPELLING_MISTAKE   — An actor or use case name closely resembles a scenario name but is misspelled (e.g. "Custmer" instead of "Customer"). ONE error only — do NOT also report MISSING_ACTOR/MISSING_USE_CASE or EXTRA_ACTOR/EXTRA_USE_CASE for the same element.
 
 DO NOT CHECK AND DO NOT REPORT:
 - DISCONNECTED_ACTOR (handled by rule system)
@@ -1733,16 +1733,14 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: Only report MISSING_ACTOR for persons/systems that are EXPLICITLY written in the scenario.
 - STRICT: Do NOT invent actors that are implied but not written.
 - STRICT: A single actor is enough if scenario mentions only one person/system.
-- STRICT: Before reporting MISSING_ACTOR, check the actor against EVERY drawn actor for a semantic/synonym match (see SEMANTIC MATCHING section) AND for a near-identical spelling match (1-2 letters off). Only if NEITHER kind of match exists anywhere in the diagram should you report MISSING_ACTOR.
-- STRICT: If an actor name in the diagram is a near-identical misspelling (not just topically similar) of a scenario actor → report SPELLING_MISTAKE ONLY, NOT MISSING_ACTOR.
+- STRICT: If an actor name in the diagram is a close misspelling of a scenario actor → report SPELLING_MISTAKE ONLY, NOT MISSING_ACTOR.
 
 ### MISSING_USE_CASE hallucination prevention:
 - STRICT: Only report MISSING_USE_CASE for actions that are EXPLICITLY written in the scenario.
 - STRICT: Do NOT split one use case into multiple — if scenario says "login", do NOT also require "validate credentials", "check password" etc.
 - STRICT: Do NOT invent sub-use-cases that are not written in the scenario.
 - STRICT: Matching is CASE-INSENSITIVE — "Login" and "login" are the same use case.
-- STRICT: Before reporting MISSING_USE_CASE, go through the scenario action one at a time and compare it against EVERY use case oval drawn in the diagram — checking both semantic/synonym equivalence (see SEMANTIC MATCHING section above) and near-identical spelling (1-2 letters off). Only report MISSING_USE_CASE if truly no drawn use case matches by either check.
-- STRICT: If a use case name in the diagram is a near-identical misspelling (not just topically similar) of a scenario use case → report SPELLING_MISTAKE ONLY, NOT MISSING_USE_CASE.
+- STRICT: If a use case name in the diagram is a close misspelling of a scenario use case → report SPELLING_MISTAKE ONLY, NOT MISSING_USE_CASE.
 
 ### DISCONNECTED_ACTOR hallucination prevention:
 - STRICT: A line touching the actor's body, torso, or any limb area = CONNECTED. Do NOT report DISCONNECTED_ACTOR for such actors.
@@ -2179,7 +2177,7 @@ def _build_image_prompt(diagram_type: str, scenario: str) -> str:
 10. MISSING_VERB_IN_USE_CASE — Use case oval label must follow the 'Verb + Noun' format ONLY — a single action verb followed by a single noun/object (e.g. "Manage Order", "Place Order", "Browse Products"). Flag this if the label is missing a verb, missing a noun, or has extra words beyond verb + noun.
 11. DUPLICATE_ACTOR — Same actor name appears twice.
 12. DUPLICATE_USE_CASE — Same use case name appears twice.
-13. SPELLING_MISTAKE   — An actor or use case name IS VISIBLE but is a NEAR-IDENTICAL misspelling of a scenario name — differing by only 1-2 letters and clearly the same word. Do NOT count topically-related or same-starting-letter names as a spelling match. ONE error only — do NOT also report MISSING_ACTOR/MISSING_USE_CASE or EXTRA_ACTOR/EXTRA_USE_CASE for the same element.
+13. SPELLING_MISTAKE   — An actor or use case name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_ACTOR/MISSING_USE_CASE or EXTRA_ACTOR/EXTRA_USE_CASE for the same element.
 14. WRONG_ACTOR_NAME — Actor names must be nouns/roles (e.g. "Customer", "Admin", "Bank", "System"), never verbs/actions (e.g. "Login", "Register", "Manage", "Browse", "Pay"). Flag any actor whose label is a verb/action.
 CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisation as missing/extra."""
         dtype_label = "USE CASE"
@@ -2188,12 +2186,6 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 - An actor stick-figure occupies vertical space (head, body, hands, feet).
 - Any line touching ANY part of the stick-figure = CONNECTED.
 - Only flag DISCONNECTED_ACTOR if there is genuinely no line anywhere near the actor.
-
-## MISSING_ACTOR / MISSING_USE_CASE — AVOID FALSE POSITIVES ON CORRECT DIAGRAMS:
-- Before reporting MISSING_ACTOR or MISSING_USE_CASE, go through each scenario person/action ONE AT A TIME and compare it against EVERY actor/use-case oval visible in the image — checking BOTH semantic/synonym equivalence (different wording for the same capability, e.g. "Place Order" ≈ "Order Product") AND near-identical spelling (1-2 letters off).
-- Only report MISSING_ACTOR / MISSING_USE_CASE if NEITHER a semantic match NOR a spelling match exists anywhere in the image.
-- If a semantic/synonym equivalent is visible → NOT missing, no error.
-- If a near-identical misspelling is visible → report SPELLING_MISTAKE instead, NOT missing.
 
 ## SYSTEM BOUNDARY NAME RULE:
 - If boundary EXISTS with wrong name → report WRONG_SYSTEM_BOUNDARY_NAME, suggest renaming.
