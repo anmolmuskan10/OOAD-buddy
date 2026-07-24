@@ -998,31 +998,6 @@ def _rule_check_class(shapes: List[Dict], scenario: str = "") -> List[Dict]:
                     "auto_fix": {"fixable": False},
                 })
 
-    # ── MISSING_CLASS — deterministic: a relationship arrow references a
-    # class (via its from/to endpoints) that was never actually drawn as a
-    # class shape on the canvas. This does not depend on the LLM at all,
-    # so it can never be silently skipped/hallucinated-away.
-    _referenced_classes = {}  # norm_name -> display_name
-    for s in shapes:
-        t = str(s.get("type", "")).lower()
-        if not any(k in t for k in ("association", "aggregation", "composition",
-                                     "generalization", "dependency")):
-            continue
-        for raw in (s.get("from"), s.get("to")):
-            raw = str(raw or "").strip()
-            rn = _n(raw)
-            if rn and rn not in class_names and rn not in _referenced_classes:
-                _referenced_classes[rn] = raw
-
-    for rn, disp in _referenced_classes.items():
-        errors.append({
-            "error_type": "MISSING_CLASS", "severity": "ERROR",
-            "element": disp,
-            "description": f"Class '{disp}' is referenced by a relationship arrow but is not drawn as a class in the diagram.",
-            "suggestion": f"Add a class box named '{disp}'.",
-            "auto_fix": {"fixable": True, "action": "add_shape", "shape_type": "class", "name": disp},
-        })
-
     return errors
 
 
@@ -1224,10 +1199,6 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
     existing_rels = _existing_relationships(clean_shapes)
     existing_mult = _existing_multiplicities(clean_shapes)
     ignored_set   = set(ignored_errors or [])
-    rule_missing_classes = {
-        _n(str(r.get("element", "")))
-        for r in rule_errors if _n(str(r.get("error_type", ""))) == "missing_class"
-    }
 
     def _error_fingerprint(e: Dict) -> str:
         """Unique key for an error — used for ignored_errors matching."""
@@ -1251,10 +1222,6 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
 
         # Drop if user has ignored this error previously
         if _error_fingerprint(e) in ignored_set:
-            return False
-
-        # Drop LLM MISSING_CLASS if the rule engine already reported this exact class
-        if et == "missing_class" and elem and elem in rule_missing_classes:
             return False
 
         # Drop any relationship error where both endpoints are actors in the diagram
@@ -2002,7 +1969,7 @@ def _call_model(prompt: str, api_key: str, model: str) -> Optional[Dict]:
         ],
         "temperature": 0,
         "seed": 42,
-        "max_tokens": 2200,
+        "max_tokens": 1500,
     }).encode("utf-8")
 
     req = urllib.request.Request(
@@ -2297,18 +2264,16 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 - Only report MISSING_RELATIONSHIP if scenario EXPLICITLY states a relationship (has, contains, inherits, etc.).
 - Do NOT invent relationships just because two classes exist.
 
-## MISSING LABEL / WRONG LABEL — MANDATORY CHECKLIST:
-You MUST do this check explicitly — do not skip it:
-1. First, list every association/aggregation/composition arrow you can see in the image, with its two endpoint classes.
-2. For each arrow, look for a label near its midpoint (a word/phrase such as "manages", "places", "contains").
-3. Compare that arrow's endpoints against the SCENARIO text — if the scenario describes that relationship with a specific verb/phrase:
-   - If the arrow has NO visible label at all → report MISSING_ASSOCIATION_LABEL (WARNING).
-   - If the arrow HAS a visible label but it is a clearly different word/meaning than the scenario's verb → report WRONG_ASSOCIATION_LABEL (WARNING).
-   - Minor wording variations (e.g. "manage" vs "manages") are acceptable — do NOT report those.
+## MISSING LABEL RULE:
+- Only report MISSING_ASSOCIATION_LABEL if scenario names what the relationship should be called.
+- If scenario does not name the relationship → labels are optional.
+
+## WRONG ASSOCIATION LABEL RULE — CRITICAL:
+- Check every association/aggregation/composition arrow that HAS a visible label.
+- If the drawn label does NOT match what the scenario describes for that relationship → report WRONG_ASSOCIATION_LABEL as a WARNING.
 - Example: scenario says "Bank manages Customer" but arrow label reads "owns" → WRONG_ASSOCIATION_LABEL.
-- Example: scenario says "Bank manages Customer" and the arrow between Bank and Customer has no label at all → MISSING_ASSOCIATION_LABEL.
-- suggestion for WRONG_ASSOCIATION_LABEL: ALWAYS name the exact correct word/phrase from the scenario, e.g. "Change label 'owns' to 'manages' as described in the scenario."
-- If the scenario does NOT name a specific verb/phrase for a relationship, labels are optional — do NOT report either error for that relationship.
+- suggestion: ALWAYS name the exact correct word/phrase from the scenario, e.g. "Change label 'owns' to 'manages' as described in the scenario."
+- Minor wording variations (e.g. "manage" vs "manages") are acceptable — do NOT report those.
 
 ## MULTIPLICITY RULES:
 - If a multiplicity value is visible at EITHER end of an association/aggregation/composition arrow → multiplicity EXISTS, do NOT report MISSING_MULTIPLICITY.
@@ -2320,11 +2285,8 @@ You MUST do this check explicitly — do not skip it:
 - WRONG_INHERITANCE_DIRECTION — the arrow should point FROM the child class TO the parent class; flag if reversed.
 - CIRCULAR_INHERITANCE — flag if A inherits from B and B inherits from A.
 
-## DUPLICATE_CLASS — MANDATORY CHECKLIST:
-You MUST do this check explicitly — do not skip it:
-1. List every class box you can see in the image, in reading order, with its exact name (case-insensitive).
-2. Compare every class name against every other class name in that list.
-3. If the SAME class name (ignoring case) appears on two or more separate class boxes → report ONE DUPLICATE_CLASS error naming that class.
+## DUPLICATE / EMPTY / SELF-ASSOCIATION:
+- DUPLICATE_CLASS — same class name appears twice in the image.
 - EMPTY_CLASS_NAME — a class box has no visible name or a placeholder like "Class 1".
 - SELF_ASSOCIATION — a class connects to itself; only flag as a WARNING unless the scenario explicitly describes this.
 
@@ -2426,7 +2388,7 @@ def _call_model_with_image(prompt: str, image_b64: str, mime_type: str, api_key:
         ],
         "temperature": 0,
         "seed": 42,
-        "max_tokens": 2200,
+        "max_tokens": 1500,
     }).encode("utf-8")
 
     req = urllib.request.Request(
