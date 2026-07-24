@@ -2255,6 +2255,7 @@ def _build_image_prompt(diagram_type: str, scenario: str) -> str:
 13. SPELLING_MISTAKE   — An actor or use case name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_ACTOR/MISSING_USE_CASE or EXTRA_ACTOR/EXTRA_USE_CASE for the same element.
 14. WRONG_ACTOR_NAME — Actor names must be nouns/roles (e.g. "Customer", "Admin", "Bank", "System"), never verbs/actions (e.g. "Login", "Register", "Manage", "Browse", "Pay"). Flag any actor whose label is a verb/action.
 15. EMPTY_USE_CASE_LABEL — [MANDATORY CHECK] A use case oval that is blank / has no visible text inside it at all. This is DIFFERENT from MISSING_USE_CASE (a use case oval that IS present but empty must be flagged as EMPTY_USE_CASE_LABEL, not skipped).
+16. UNLABELLED_ACTOR — [MANDATORY CHECK] An actor stick-figure that is present but has NO name/label written under or beside it at all. Check every actor individually.
 CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisation as missing/extra."""
         dtype_label = "USE CASE"
         extra_rules = """
@@ -2299,7 +2300,13 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 7. UNLABELLED_OBJECT — Object box has no label (say "object" not "lifeline").
 8. MISSING_DELETION_SYMBOL — Lifeline has no X/destroy marker. Only report if X symbols are genuinely absent.
 9. UNLABELLED_ARROW — Message arrow has no label.
-10. SPELLING_MISTAKE — A lifeline/object/actor name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_LIFELINE or EXTRA_LIFELINE for the same element."""
+10. SPELLING_MISTAKE — A lifeline/object/actor name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_LIFELINE or EXTRA_LIFELINE for the same element.
+11. EXTRA_LIFELINE — Lifeline/participant box present in the image but not mentioned anywhere in the scenario (WARNING).
+12. DUPLICATE_LIFELINE — The same participant name appears on two different lifeline boxes (WARNING).
+13. INVALID_MESSAGE_SOURCE — [MANDATORY CHECK] A message arrow's starting point does not touch/originate from any lifeline's vertical dashed line.
+14. INVALID_MESSAGE_TARGET — [MANDATORY CHECK] A message arrow's ending point does not touch/land on any lifeline's vertical dashed line.
+15. MISSING_ACTIVATION — A lifeline that clearly receives an incoming message has no activation box (thin rectangle) drawn on its dashed line at that point. Only report if scenario/diagram convention clearly expects activation bars (skip if the whole diagram consistently omits them, in which case it is a style choice, not an error).
+16. MISSING_ALT_FRAGMENT — The scenario explicitly describes conditional/branching logic (if/else, success/failure paths) but no alt/opt combined-fragment box is drawn around the relevant messages."""
         dtype_label = "SEQUENCE"
         extra_rules = """
 ## SELF-MESSAGE RULE:
@@ -2312,6 +2319,10 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 ## OBJECT vs LIFELINE:
 - An object box (rectangle with name) IS a named participant. Do NOT report it as unnamed.
 - If the object is truly empty/unlabelled → say "Object has no name", not "lifeline has no name".
+
+## MESSAGE ENDPOINT RULE — CHECK EVERY ARROW:
+- Go through every message arrow one at a time and confirm both ends touch a lifeline's dashed vertical line.
+- If either end floats in empty space with no lifeline nearby → report INVALID_MESSAGE_SOURCE or INVALID_MESSAGE_TARGET accordingly.
 
 ## MESSAGE ORDER:
 - Only report WRONG_MESSAGE_ORDER if you are 100% certain. When in doubt → SKIP."""
@@ -2331,7 +2342,8 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 12. EMPTY_CLASS_NAME          — Class has no name or placeholder like "Class 1".
 13. SELF_ASSOCIATION          — Class connected to itself (warn unless scenario says so).
 14. SPELLING_MISTAKE          — A class name closely resembles a scenario class name but is misspelled (e.g. "Custmer" instead of "Customer"). ONE error only — do NOT also report MISSING_CLASS or EXTRA_CLASS for the same element.
-15. WRONG_ASSOCIATION_LABEL   — [MANDATORY CHECK] Go through EVERY association/aggregation/composition arrow that HAS a visible label one at a time, and compare that label's meaning against what the scenario describes for that specific relationship. If it does not match, report WRONG_ASSOCIATION_LABEL. ALWAYS include the correct word/phrase taken directly from the scenario in the "suggestion" field. Do not skip an arrow just because it has some label — a wrong label is still an error."""
+15. WRONG_ASSOCIATION_LABEL   — [MANDATORY CHECK] Go through EVERY association/aggregation/composition arrow that HAS a visible label one at a time, and compare that label's meaning against what the scenario describes for that specific relationship. If it does not match, report WRONG_ASSOCIATION_LABEL. ALWAYS include the correct word/phrase taken directly from the scenario in the "suggestion" field. Do not skip an arrow just because it has some label — a wrong label is still an error.
+16. INVALID_MULTIPLICITY      — A multiplicity value IS present but its format is not valid UML (valid formats: "1", "0..1", "*", "0..*", "1..*", or a plain number). e.g. "abc" or "many" written as the multiplicity value is INVALID_MULTIPLICITY, not MISSING_MULTIPLICITY."""
         dtype_label = "CLASS"
         extra_rules = """
 ## RELATIONSHIP TYPE VALIDATION:
@@ -2426,7 +2438,14 @@ For each error, provide an "auto_fix" object. Set "fixable": true only for these
 - MISSING_VERB_IN_USE_CASE → action: "rename_shape", name: <corrected name with verb + noun only>, fixable: true
 - MISSING_ASSOCIATION_LABEL → action: "add_label", from_element, to_element, name: <correct label from scenario>, fixable: true
 - WRONG_ASSOCIATION_LABEL → action: "add_label", from_element, to_element, label: <correct label from scenario>, fixable: true
+- UNLABELLED_ACTOR → action: "rename_shape", name: <suggested actor name from scenario>, fixable: true
 - WRONG_ACTOR_NAME → fixable: false
+- INVALID_MULTIPLICITY → fixable: false (needs human judgement on correct value)
+- EXTRA_LIFELINE → fixable: false (user may have added intentionally)
+- DUPLICATE_LIFELINE → action: "merge_shapes", name, fixable: true
+- INVALID_MESSAGE_SOURCE / INVALID_MESSAGE_TARGET → fixable: false (requires manual re-drawing)
+- MISSING_ACTIVATION → action: "add_shape", shape_type: "activation_box", name: <lifeline name>, fixable: true
+- MISSING_ALT_FRAGMENT → fixable: false (requires manual layout decision)
 All other errors → fixable: false
 
 ## RESPONSE FORMAT (JSON only, no markdown)
